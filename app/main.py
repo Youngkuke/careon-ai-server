@@ -17,7 +17,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allow_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    # "*"는 Authorization 을 포함해 프론트가 보내는 헤더를 프리플라이트에서 그대로 허용한다.
     allow_headers=["*"],
 )
 
