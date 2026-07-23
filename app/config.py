@@ -44,7 +44,7 @@ class Settings:
         o.strip()
         for o in os.getenv(
             "CORS_ALLOW_ORIGINS",
-            "https://www.careon.site,https://careon.site,http://localhost:3000,http://localhost:5173",
+            "https://www.careon.site,https://careon.site,http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173",
         ).split(",")
         if o.strip()
     ]
