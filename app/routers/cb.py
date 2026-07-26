@@ -5,6 +5,7 @@
   POST   /api/v1/cb/threads                         대화 시작 (봇이 먼저 인사)
   POST   /api/v1/cb/messages                        턴 진행
   DELETE /api/v1/cb/threads/{thread_id}             다시 시작
+  GET    /api/v1/cb/threads/latest                  마지막으로 마친 대화 (화면 복원)
   GET    /api/v1/cb/threads/{thread_id}/results     결과 카드 (③에서 추가)
   GET    /api/v1/cb/institutions/{serv_id}          제도 상세 (③)
   POST   /api/v1/cb/institutions/{serv_id}/translate 쉬운 말 설명 (③)
@@ -27,6 +28,7 @@ from app.cb.schemas import (
     InstitutionCard,
     InstitutionDetail,
     Intake,
+    LatestThreadResponse,
     MessageOnly,
     PHASE_GATHERING,
     PHASE_READY,
@@ -92,13 +94,59 @@ async def post_message(
 
     result = await cb_graph.run_turn(thread_id, carer_id, body.message, region_sgg)
 
+    if result.get("phase") == PHASE_READY:
+        # 새로고침·재로그인 뒤에 결과 화면으로 돌아올 수 있게 남긴다.
+        # 기록에 실패해도 이번 응답은 정상이므로 대화를 끊지 않는다.
+        try:
+            await cb_profile.mark_ready(carer_id, thread_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("[cb] 완료 대화 기록 실패 thread=%s user=%s", thread_id, carer_id)
+
     summary = result.get("result_summary")
     return TurnResponse(
         thread_id=thread_id,
         phase=result.get("phase") or PHASE_GATHERING,
         message=result.get("answer") or "",
         filters=Filters(**(result.get("filters") or {})),
-        intake=Intake(age=result.get("age"), target_for=result.get("target_for")),
+        intake=Intake(
+            target_for=result.get("target_for"),
+            age=result.get("age"),
+            caree_age=result.get("caree_age"),
+        ),
+        result_summary=ResultSummary(**summary) if summary else None,
+    )
+
+
+@router.get("/threads/latest", response_model=LatestThreadResponse,
+            dependencies=[Depends(require_cb)])
+async def get_latest_thread(
+    carer_id: int = Depends(get_current_carer_id),
+) -> LatestThreadResponse:
+    """마지막으로 결과까지 마친 대화.
+
+    화면을 다시 열었을 때 상담을 처음부터 시킬지, 지난 결과를 보여줄지
+    프론트가 이걸로 정한다. 없으면 thread_id가 null인 200이다 — '아직 안 했다'는
+    정상 상태라서 404가 아니다.
+
+    라우트 순서 주의: /threads/{thread_id}보다 먼저 선언해야 'latest'가
+    thread_id로 잡히지 않는다.
+    """
+    thread_id = await cb_profile.last_ready_thread(carer_id)
+    if not thread_id:
+        return LatestThreadResponse()
+
+    state = await threads.get_state(thread_id)
+    # 대화를 지웠는데 기록만 남은 경우. 없는 대화를 가리키느니 없다고 답한다.
+    if state is None or int(state.get("user_id") or 0) != carer_id:
+        logger.info("[cb] 기록된 완료 대화가 사라졌다 thread=%s user=%s", thread_id, carer_id)
+        return LatestThreadResponse()
+
+    results = state.get("results") or {}
+    summary = state.get("result_summary") or {}
+    return LatestThreadResponse(
+        thread_id=thread_id,
+        phase=state.get("phase"),
+        generated_at=results.get("generated_at"),
         result_summary=ResultSummary(**summary) if summary else None,
     )
 

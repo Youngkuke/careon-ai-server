@@ -69,3 +69,32 @@ async def region_sgg(user_id: int) -> Optional[str]:
         )
         logger.info("[profile] 지역 1회 복사 user=%s → %s", user_id, sgg or "(없음)")
         return sgg
+
+
+async def mark_ready(user_id: int, thread_id: str) -> None:
+    """결과까지 마친 대화를 기록한다.
+
+    새로고침이나 재로그인 뒤에 결과 화면으로 돌아갈 수 있게 하는 유일한 단서다.
+    기록에 실패해도 이번 대화는 정상이므로 호출부에서 삼킨다.
+    """
+    pool = await db.connect()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO cb.cb_user_profile (user_id, last_ready_thread_id, last_ready_at) "
+            "VALUES ($1, $2, now()) "
+            "ON CONFLICT (user_id) DO UPDATE "
+            "SET last_ready_thread_id = EXCLUDED.last_ready_thread_id, "
+            "    last_ready_at = EXCLUDED.last_ready_at",
+            user_id, thread_id,
+        )
+
+
+async def last_ready_thread(user_id: int) -> Optional[str]:
+    """마지막으로 결과까지 마친 대화의 thread_id. 없으면 None."""
+    pool = await db.connect()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT last_ready_thread_id FROM cb.cb_user_profile WHERE user_id = $1",
+            user_id,
+        )
+    return (row["last_ready_thread_id"] if row else None) or None
