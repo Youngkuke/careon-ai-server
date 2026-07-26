@@ -51,6 +51,7 @@ _ensure_selector_event_loop()
 
 _pool: Optional[AsyncConnectionPool] = None
 _graph = None
+_checkpointer: Optional[AsyncPostgresSaver] = None
 
 
 # --- 분기 ---------------------------------------------------------------------
@@ -116,7 +117,7 @@ def _checkpointer_dsn() -> str:
 
 async def startup() -> None:
     """앱 기동 시 1회. 풀을 열고 checkpointer 테이블을 준비한다."""
-    global _pool, _graph
+    global _pool, _graph, _checkpointer
     if _graph is not None:
         return
 
@@ -132,27 +133,40 @@ async def startup() -> None:
     )
     await _pool.open(wait=True)
 
-    checkpointer = AsyncPostgresSaver(_pool)
+    _checkpointer = AsyncPostgresSaver(_pool)
     # cb.checkpoints / cb.checkpoint_writes / cb.checkpoint_blobs 를 만든다.
     # 이미 있으면 아무 일도 하지 않는다.
-    await checkpointer.setup()
+    await _checkpointer.setup()
 
-    _graph = build_graph(checkpointer)
+    _graph = build_graph(_checkpointer)
     logger.info("[cb.graph] 준비 완료 (checkpointer=cb 스키마)")
 
 
 async def shutdown() -> None:
-    global _pool, _graph
+    global _pool, _graph, _checkpointer
     _graph = None
+    _checkpointer = None
     if _pool is not None:
         await _pool.close()
         _pool = None
+
+
+def ready() -> bool:
+    """startup()이 성공했는지. 라우터가 503을 내려줄지 판단하는 데 쓴다."""
+    return _graph is not None
 
 
 def graph():
     if _graph is None:
         raise RuntimeError("cb 그래프가 초기화되지 않았습니다. startup()을 먼저 부르세요.")
     return _graph
+
+
+def checkpointer() -> AsyncPostgresSaver:
+    """스레드 삭제('다시 시작')처럼 그래프를 거치지 않는 조작에 쓴다."""
+    if _checkpointer is None:
+        raise RuntimeError("cb 그래프가 초기화되지 않았습니다. startup()을 먼저 부르세요.")
+    return _checkpointer
 
 
 # --- 실행 ---------------------------------------------------------------------

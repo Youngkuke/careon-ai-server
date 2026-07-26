@@ -54,6 +54,36 @@ class PolicyNotFound(ApiError):
     default_message = "해당 제도를 찾을 수 없습니다."  # api.md 문구
 
 
+class CbUnavailable(ApiError):
+    """cb 그래프 초기화 실패(DB/체크포인터). 기존 챗봇과 분리해서 알린다."""
+
+    status_code = 503
+    code = "CB_UNAVAILABLE"
+    default_message = "챗봇 검색엔진을 사용할 수 없습니다. 잠시 후 다시 시도해주세요."
+
+
+class ThreadNotFound(ApiError):
+    """cb 대화 스레드가 checkpointer에 없다 (삭제됐거나 없는 id)."""
+
+    status_code = 404
+    code = "THREAD_NOT_FOUND"
+    default_message = "대화를 찾을 수 없습니다. 새로 시작해주세요."
+
+
+class ResultsNotReady(ApiError):
+    """아직 정보 수집 중(phase=gathering)이라 결과가 없다."""
+
+    status_code = 409
+    code = "RESULTS_NOT_READY"
+    default_message = "아직 대화가 진행 중입니다. 대화를 마친 뒤 결과를 볼 수 있습니다."
+
+
+class InstitutionNotFound(ApiError):
+    status_code = 404
+    code = "INSTITUTION_NOT_FOUND"
+    default_message = "해당 제도를 찾을 수 없습니다."
+
+
 class DatabaseUnavailable(ApiError):
     """DATABASE_URL 미설정/연결 실패. POLICY_NOT_FOUND로 오인되지 않게 분리한다."""
 
