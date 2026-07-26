@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends
 from app.auth import get_current_carer_id
 from app.cb import cards, db as cb_db, explain
 from app.cb import graph as cb_graph
+from app.cb import profile as cb_profile
 from app.cb import threads
 from app.cb.schemas import (
     BannerSection,
@@ -69,8 +70,7 @@ async def post_message(
         region_sgg = state.get("region_sgg")
     else:
         thread_id = threads.new_thread_id()
-        # 지역은 cb_user_profile에서 읽어온다(별도 커밋). 그 전까지는 전국+서울시로 검색한다.
-        region_sgg = None
+        region_sgg = await cb_profile.region_sgg(carer_id)
 
     result = await cb_graph.run_turn(thread_id, carer_id, body.message, region_sgg)
 
