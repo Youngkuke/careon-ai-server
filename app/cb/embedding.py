@@ -46,7 +46,7 @@ def _retry_after(exc: Exception) -> Optional[float]:
     return None
 
 
-async def _with_retry(make_call, *, label: str, attempts: int = 5, base: float = 4.0):
+async def with_retry(make_call, *, label: str, attempts: int = 5, base: float = 4.0):
     """TPM 제한을 백오프로 흡수한다. make_call은 매번 새 코루틴을 만들어야 한다."""
     for attempt in range(1, attempts + 1):
         try:
@@ -102,7 +102,7 @@ async def embed_texts(texts: Sequence[str]) -> List[List[float]]:
         if cb_settings.embedding_dim != 1536:
             kwargs["dimensions"] = cb_settings.embedding_dim
 
-        resp = await _with_retry(
+        resp = await with_retry(
             lambda: client().embeddings.create(**kwargs),
             label="embeddings",
         )
@@ -172,7 +172,7 @@ async def infer_tags(row: Dict[str, Any]) -> Dict[str, List[str]]:
     ]
     body = "\n".join(f"{k}: {v}" for k, v in parts if v)[:MAX_EMBEDDING_CHARS]
 
-    resp = await _with_retry(
+    resp = await with_retry(
         lambda: client().chat.completions.create(
             model=cb_settings.openai_model,
             messages=[
@@ -204,7 +204,7 @@ async def infer_tags_many(
     동시성 기본값이 2인 이유: gpt-4o는 분당 토큰(TPM) 제한이 있고, 이 프롬프트는
     제도 본문을 통째로 넣어 건당 토큰이 크다. 4로 돌렸을 때 450건 중 209건이
     RateLimitError로 유실됐다. 낮춰서 애초에 덜 부딪히고, 부딪힌 건은
-    _with_retry가 흡수한다.
+    with_retry가 흡수한다.
     """
     sem = asyncio.Semaphore(concurrency)
     results: Dict[str, Dict[str, List[str]]] = {}

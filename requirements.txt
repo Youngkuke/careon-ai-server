@@ -7,6 +7,11 @@ anthropic==0.117.0
 # 챗봇 검색엔진(app/cb) 전용
 openai==1.109.1
 httpx==0.28.1
+# LangGraph 대화 그래프. checkpointer는 psycopg를 쓰므로 asyncpg와 공존한다
+# (나머지 cb 코드는 전부 asyncpg). 공식 구현을 그대로 쓰기 위한 선택이다.
+langgraph==0.6.11
+langgraph-checkpoint-postgres==2.0.25
+psycopg[binary,pool]==3.2.13
 PyJWT==2.10.1
 asyncpg==0.30.0
 python-dotenv==1.0.1
