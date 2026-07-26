@@ -149,6 +149,9 @@ activemq-data/
 
 # Environments
 .env
+# .env.bak / .env.local 등 파생 파일에도 실제 키가 들어간다. .env.example만 예외로 둔다.
+.env.*
+!.env.example
 .envrc
 .venv
 env/
@@ -216,3 +219,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 자격증명 / 키 파일 (실수로 만든 파일이 커밋되는 것을 막는 안전망)
+secrets.*
+credentials.*
+service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.bak
+# DB 덤프에는 운영 데이터가 통째로 들어간다
+*.dump
+db_dump*.sql
+
