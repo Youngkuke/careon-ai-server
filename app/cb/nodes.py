@@ -11,7 +11,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from app.cb import cards, constants, embedding, prompts, search
+from app.cb import cards, constants, eligibility, embedding, prompts, search
 from app.cb.config import cb_settings
 from app.cb.state import CbState, active_filters, has_any_filter, merge_tags
 
@@ -351,13 +351,42 @@ async def search_institutions(state: CbState) -> Dict[str, Any]:
         region_keys=region_keys,
         limit=cards.RESULT_LIMIT,
     )
-    rows = _apply_target_signal(rows, state.get("target_for"))
+    rows = _rerank(rows, state, query_text)
     logger.info(
         "[search] q=%r filters=%s region=%s 대상=%s → %d건",
         query_text[:40], filters, state.get("region_sgg"),
         state.get("target_for") or "미상", len(rows),
     )
     return {"candidates": rows}
+
+
+def _rerank(rows: List[Dict[str, Any]], state: CbState,
+            query_text: str) -> List[Dict[str, Any]]:
+    """SQL이 매긴 rrf에 대화에서만 알 수 있는 신호를 얹고 다시 세운다.
+
+    SQL은 태그와 유사도까지만 안다. '누구를 위해 찾는지'와 '사용자가 어떤
+    자격을 밝혔는지'는 대화에만 있어서 여기서 반영한다.
+    """
+    _apply_target_signal(rows, state.get("target_for"))
+    eligibility.apply(
+        rows,
+        user_text=" ".join([query_text] + _user_texts(state)),
+        user_household=state.get("household") or [],
+    )
+    rows.sort(key=lambda r: (-(r.get("rrf") or 0.0),
+                             r.get("dist") if r.get("dist") is not None else 9.0))
+    return rows
+
+
+def _user_texts(state: CbState, turns: int = HISTORY_TURNS) -> List[str]:
+    """최근 사용자 발화 원문들. 자격 언급("저 한부모예요")을 찾는 데 쓴다."""
+    out: List[str] = []
+    for message in (state.get("messages") or [])[-turns:]:
+        role = getattr(message, "type", None) or getattr(message, "role", None)
+        content = getattr(message, "content", None)
+        if role in ("human", "user") and isinstance(content, str):
+            out.append(content)
+    return out
 
 
 # 대상이 어긋나는 제도에 매길 감점 (rrf에 곱한다).
@@ -398,9 +427,7 @@ def _apply_target_signal(rows: List[Dict[str, Any]],
             row["rrf"] = float(row.get("rrf") or 0.0) * TARGET_MISMATCH_FACTOR
             row["target_mismatch"] = True
 
-    # 감점했으면 순위가 달라진다. 다시 세운다.
-    rows.sort(key=lambda r: (-(r.get("rrf") or 0.0),
-                             r.get("dist") if r.get("dist") is not None else 9.0))
+    # 정렬은 _rerank가 모든 신호를 얹은 뒤 한 번만 한다.
     return rows
 
 

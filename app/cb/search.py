@@ -174,13 +174,15 @@ WITH base AS (
          + coalesce($7::float8 / ($8::float8 + l.rank), 0) AS rrf
     FROM vec_rank v FULL OUTER JOIN lex_rank l ON l.serv_id = v.serv_id
 )
--- 결과 카드에 그대로 실리는 컬럼만 가져온다. 본문(target_detail/service_content/
--- apply_method)은 여기서 빼고 상세 API에서만 읽는다 — 20건에 본문을 붙이면
--- 응답이 수만 자가 된다.
+-- 결과 카드에 실리는 컬럼 + 자격 판정에 쓰는 지원대상 원문.
+-- 나머지 본문(service_content/apply_method)은 상세 API에서만 읽는다.
+-- target_detail은 응답에 나가지 않는다 — 자격이 한정된 제도를 걸러내려면
+-- 태그만으로는 부족해서 서버 안에서만 쓴다 (app/cb/eligibility.py).
 SELECT f.serv_id, f.vec_rank, f.lex_rank, f.dist, f.lex_score, f.rrf,
        i.serv_nm, i.source, i.region_scope, i.ctpv_nm, i.sgg_nm, i.serv_dgst,
        i.life_cycle_tags, i.household_tags, i.theme_tags, i.detail_link,
-       i.jur_org_nm, i.support_cycle, i.provision_type, i.apply_method_nm, i.contact
+       i.jur_org_nm, i.support_cycle, i.provision_type, i.apply_method_nm, i.contact,
+       i.target_detail
 FROM fused f JOIN cb.cb_institutions i ON i.serv_id = f.serv_id
 ORDER BY f.rrf DESC, f.dist NULLS LAST
 LIMIT $9

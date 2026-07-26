@@ -124,7 +124,10 @@ def split_sections(rows: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
     maybe: List[Dict[str, Any]] = []
     for index, row in enumerate(rows, 1):
         card = to_card(row, rank=index)
-        if index <= MATCHED_TOP_N and not _too_far(row.get("dist"), cutoff):
+        # 지원대상 원문에 자격이 한정돼 있으면 '맞춤'이 아니다
+        # (app/cb/eligibility.py). 목록에서 빼지는 않는다.
+        fits = not row.get("eligibility_excluded")
+        if fits and index <= MATCHED_TOP_N and not _too_far(row.get("dist"), cutoff):
             matched.append(card)
         else:
             maybe.append(card)
