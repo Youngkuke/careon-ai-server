@@ -129,6 +129,33 @@ async def upsert_institutions(rows: Sequence[Dict[str, Any]]) -> Dict[str, int]:
     return {"inserted": inserted, "updated": len(serv_ids) - inserted}
 
 
+async def fetch_institution(serv_id: str) -> Optional[Dict[str, Any]]:
+    """제도 1건 전문. 상세 API와 쉬운 말 설명이 쓴다.
+
+    내린 제도(is_active=false)도 돌려준다. 저장해 둔 유저가 열었을 때
+    404가 뜨는 것보다, 내용을 보여주고 화면에서 상태를 알리는 편이 낫다.
+    """
+    pool = await connect()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT serv_id, source, serv_nm, serv_dgst, "
+            "       life_cycle_tags, household_tags, theme_tags, "
+            "       ctpv_nm, sgg_nm, region_scope, "
+            "       target_detail, select_criteria, service_content, apply_method, "
+            "       extra_info, jur_org_nm, support_cycle, provision_type, "
+            "       apply_method_nm, detail_link, contact, criteria_year, is_active "
+            "FROM cb.cb_institutions WHERE serv_id = $1",
+            serv_id,
+        )
+    if row is None:
+        return None
+    out = dict(row)
+    # extra_info는 JSONB다. asyncpg는 문자열로 돌려준다.
+    if isinstance(out.get("extra_info"), str):
+        out["extra_info"] = json.loads(out["extra_info"] or "{}")
+    return out
+
+
 async def fetch_detail_completed_ids(source: str) -> set:
     """이미 상세까지 받아둔 serv_id 집합 (--resume용)."""
     pool = await connect()
