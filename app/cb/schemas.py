@@ -89,10 +89,16 @@ class ResultSummary(BaseModel):
 
 
 class Intake(BaseModel):
-    """자유대화 전에 먼저 확정하는 2가지. 아직 모르면 null이다."""
+    """자유대화 전에 먼저 확정하는 것들. 아직 모르면 null이다.
 
-    age: Optional[int] = None
-    target_for: Optional[str] = None     # self | caree
+    확인 순서는 대상 → 본인 나이 → (돌봄이면) 돌보는 분 연세다. 대상을 먼저
+    확인하는 이유는 의료·돌봄 이야기가 본인 것인지 돌보는 분 것인지에 따라
+    찾아야 할 제도가 통째로 달라지기 때문이다.
+    """
+
+    target_for: Optional[str] = None      # self | caree
+    age: Optional[int] = None             # 본인 나이
+    caree_age: Optional[int] = None       # 돌보는 분 연세 (target_for=caree일 때만 확인)
 
 
 class TurnResponse(BaseModel):
@@ -102,6 +108,19 @@ class TurnResponse(BaseModel):
     filters: Filters
     intake: Intake = Field(default_factory=Intake)
     # phase=gathering이면 항상 null이다.
+    result_summary: Optional[ResultSummary] = None
+
+
+class LatestThreadResponse(BaseModel):
+    """마지막으로 결과까지 마친 대화. 없으면 thread_id가 null이다.
+
+    새로고침이나 재로그인 뒤에 프론트가 결과 화면으로 돌아갈지, 상담을 새로
+    시작할지 정하는 데 쓴다. 카드는 들어가지 않는다 — 결과 API를 부르면 된다.
+    """
+
+    thread_id: Optional[str] = None
+    phase: Optional[str] = None
+    generated_at: Optional[datetime] = None
     result_summary: Optional[ResultSummary] = None
 
 

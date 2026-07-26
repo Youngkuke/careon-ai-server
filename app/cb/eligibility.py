@@ -1,4 +1,4 @@
-"""자격이 한정된 제도를 뒤로 미는 신호.
+"""자격이 한정된 제도를 목록에서 걷어내는 필터.
 
 문제: 태그 필터는 '겹치면 통과(&&)'라서, 사용자가 가구상황을 말하지 않으면
 필터가 아예 작동하지 않는다. 그 결과 지원대상이 완전히 다른 제도가 같은
@@ -11,12 +11,19 @@
 '노년'으로 필터를 통과했고, 가구태그는 아예 틀렸다(tags_source=llm).
 
 그래서 두 가지를 본다:
-  A. 지원대상 원문에 적힌 자격 한정어 (전체 856건 중 123건)
+  A. 지원대상 원문에 적힌 자격 한정어 (신원·사건 기반 + 질환 기반)
   B. 배타적인 가구상황 태그 (304건)
 
-둘 다 '제외'가 아니라 '감점'이다. 사용자가 실제로 해당자인데 말하지
-않았을 수 있고(한부모 가정인데 굳이 말하지 않는다), 빠지면 찾을 방법이
-없지만 내려가 있으면 '혹시 관심 있으실 수도'에서 볼 수 있다.
+A는 목록에서 뺀다. B는 순위만 낮춘다.
+
+처음에는 A도 감점만 했다. 말하지 않았을 뿐 해당자일 수 있으니 '혹시 관심
+있으실 수도'에 남겨두자는 판단이었다. 실측(2026-07-27)에서 그게 틀렸다.
+아버지 돌봄 상담 결과 20건에 '가정폭력피해자 의료비', '외국인근로자 등
+의료지원', '(산재근로자)케어센터지원', '영농도우미 지원'이 그대로 남았다.
+20건을 훑어야 하면 사용자가 직접 검색하는 것과 다르지 않다.
+
+되살릴 길은 열려 있다. 사용자가 대화에서 해당한다고 말하면(claimed)
+그 그룹은 감점도 제외도 하지 않는다.
 """
 import logging
 from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
@@ -56,10 +63,53 @@ EXCLUSIVE_GROUPS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
         ("국가유공", "보훈", "고엽제", "참전", "독립유공", "유공자"),
     ),
     "환경오염피해": (("환경오염피해",), ("환경오염",)),
+    "농어업인": (
+        ("농업인", "어업인", "영농", "농어업인", "농가"),
+        ("농사", "농업", "어업", "농가", "영농"),
+    ),
+}
+
+# --- A-2. 특정 질환에 한정된 제도 ------------------------------------------------
+# "아프다"는 말 하나로 856건 중 의료 제도가 전부 후보가 된다. 그중 상당수는
+# 진단명이 박혀 있어서, 그 병이 아니면 신청 자체가 안 된다. 실측에서
+# '암환자의료비지원'이 암 이야기가 없는 상담의 맞춤 6위로 올라왔다.
+#
+# 장애등록과 장기요양등급은 **일부러 넣지 않았다.** 거동이 불편한 어르신은
+# 실제로 해당할 가능성이 높은데 사용자가 등급을 먼저 말하지는 않는다.
+# 이 둘은 대화에서 직접 물어본 뒤에 판단한다.
+CONDITION_GROUPS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
+    "암": (("암환자", "암 환자", "암 진단", "항암"), ("암", "항암", "종양", "백혈병")),
+    "희귀·난치질환": (
+        ("희귀질환", "난치질환", "중증난치", "희귀·중증난치"),
+        ("희귀질환", "난치", "희귀병"),
+    ),
+    "치매": (("치매",), ("치매", "인지증")),
+    "정신질환": (
+        ("정신질환자", "중증정신질환", "조현병", "정신재활"),
+        ("정신질환", "조현병", "우울", "정신과"),
+    ),
+    "감염병": (("결핵", "한센", "에이즈", "HIV"), ("결핵", "한센", "에이즈")),
 }
 
 # 자격 한정어가 걸렸을 때의 감점. 이쪽은 원문 근거라 태그보다 신뢰도가 높다.
+# 목록에서 빠지므로 실제로는 순서에 영향을 주지 않지만, 제외를 끄고
+# 실측할 때를 위해 남겨둔다.
 EXCLUSIVE_TERM_FACTOR = 0.5
+
+# --- A-3. 등급·수급 자격 ---------------------------------------------------------
+# 위 두 그룹과 판정 방향이 반대다. 위쪽은 '사용자가 해당한다고 말하지 않았으면
+# 제외'인데, 이쪽은 **명시적으로 아니라고 답했을 때만** 제외한다.
+#
+# 거동이 불편한 어르신은 장기요양등급이 있을 가능성이 높은데 사용자가 먼저
+# 등급 얘기를 꺼내지는 않는다. 말 안 했다고 빼면 가장 필요한 제도가 사라진다.
+# 그래서 검색 직전에 직접 물어보고(app/cb/nodes.py의 ask_narrow),
+# "아니요"라는 답을 받은 것만 걷어낸다.
+DENIABLE_GROUPS: Dict[str, Tuple[str, ...]] = {
+    "장기요양등급": ("장기요양", "요양등급", "장기요양보험"),
+    "장애등록": ("등록장애인", "장애인등록", "장애정도", "장애인복지법"),
+    "기초생활수급": ("기초생활수급", "생계급여", "의료급여 수급", "기초생활보장"),
+    "차상위": ("차상위",),
+}
 
 # --- B. 배타적인 가구상황 태그 -------------------------------------------------
 # '저소득'과 '장애인'은 넣지 않는다.
@@ -77,6 +127,13 @@ def _contains_any(text: str, needles: Iterable[str]) -> bool:
     return any(needle in text for needle in needles)
 
 
+def _all_groups() -> Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]]:
+    """신원 기반 + 질환 기반. 판정 방식이 같아서 한 묶음으로 본다."""
+    merged = dict(EXCLUSIVE_GROUPS)
+    merged.update(CONDITION_GROUPS)
+    return merged
+
+
 def user_claimed_groups(user_text: str) -> Set[str]:
     """사용자가 스스로 해당한다고 말한 자격 그룹.
 
@@ -84,7 +141,7 @@ def user_claimed_groups(user_text: str) -> Set[str]:
     '가정폭력피해자'나 '산재'가 아예 없어서 태그로는 표현할 방법이 없다.
     """
     claimed = set()
-    for group, (_, user_terms) in EXCLUSIVE_GROUPS.items():
+    for group, (_, user_terms) in _all_groups().items():
         if _contains_any(user_text, user_terms):
             claimed.add(group)
     return claimed
@@ -95,25 +152,35 @@ def penalty_for(
     user_text: str,
     user_household: Sequence[str],
     claimed: Set[str],
+    denied: Sequence[str] = (),
 ) -> Tuple[float, List[str], bool]:
-    """감점 배율, 이유, 그리고 '맞춤에서 빼야 하는가'.
+    """감점 배율, 이유, 그리고 '목록에서 빼야 하는가'.
 
     세 번째 값은 지원대상 원문에 자격이 적혀 있을 때만 True다. 태그는
     72%가 LLM이 붙인 것이라 오태깅이 섞여 있어서(노인 의료 제도에
-    '한부모·조손'이 달려 있다) 섹션을 좌우하게 두면 정작 필요한 제도가
-    맞춤에서 빠진다. 태그는 순위만 낮춘다.
+    '한부모·조손'이 달려 있다) 목록을 좌우하게 두면 정작 필요한 제도가
+    사라진다. 태그는 순위만 낮춘다.
     """
     factor = 1.0
     reasons: List[str] = []
     from_source = False
 
     haystack = "%s %s" % (row.get("serv_nm") or "", row.get("target_detail") or "")
-    for group, (inst_terms, _) in EXCLUSIVE_GROUPS.items():
+    for group, (inst_terms, _) in _all_groups().items():
         if group in claimed:
             continue
         if _contains_any(haystack, inst_terms):
             factor *= EXCLUSIVE_TERM_FACTOR
             reasons.append(group)
+            from_source = True
+
+    for group in denied or ():
+        terms = DENIABLE_GROUPS.get(group)
+        if terms and _contains_any(haystack, terms):
+            # 사용자가 해당하지 않는다고 직접 답했다. 추정이 아니라 답변이므로
+            # 위 그룹들과 같은 무게로 걷어낸다.
+            factor *= EXCLUSIVE_TERM_FACTOR
+            reasons.append("%s 아님" % group)
             from_source = True
 
     mine = set(user_household or [])
@@ -129,28 +196,42 @@ def apply(
     rows: List[Dict[str, Any]],
     user_text: str,
     user_household: Sequence[str],
+    denied: Sequence[str] = (),
 ) -> List[Dict[str, Any]]:
-    """자격이 어긋나는 제도의 rrf를 낮춘다. 목록에서 빼지는 않는다."""
+    """자격이 어긋나는 제도를 걷어낸 목록을 돌려준다.
+
+    원문에 자격이 박힌 건은 빼고, 태그로만 어긋나는 건은 순위만 낮춘다.
+    denied는 사용자가 '해당하지 않는다'고 직접 답한 등급·수급 자격이다.
+    """
     claimed = user_claimed_groups(user_text or "")
     if claimed:
         logger.info("[eligibility] 사용자가 밝힌 자격: %s", ", ".join(sorted(claimed)))
+    if denied:
+        logger.info("[eligibility] 해당 없다고 답한 자격: %s", ", ".join(denied))
 
+    kept: List[Dict[str, Any]] = []
     demoted = 0
-    excluded = 0
+    dropped: List[str] = []
     for row in rows:
         factor, reasons, from_source = penalty_for(
-            row, user_text or "", user_household, claimed)
+            row, user_text or "", user_household, claimed, denied)
         if factor >= 1.0:
+            kept.append(row)
+            continue
+        if from_source:
+            # 지원대상 원문에 자격이 적혀 있고 사용자는 해당한다고 말한 적이
+            # 없다. 순위만 낮추면 경계에서 흔들린다 — 실제로 '가정폭력피해자
+            # 의료비'가 감점 뒤에도 8위/9위를 오갔다.
+            dropped.append("%s(%s)" % (row.get("serv_nm") or row.get("serv_id"),
+                                       ",".join(reasons)))
             continue
         row["rrf"] = float(row.get("rrf") or 0.0) * factor
         row["eligibility_notes"] = reasons
         demoted += 1
-        if from_source:
-            # 순위만 낮추면 경계에서 흔들린다. 실제로 '가정폭력피해자 의료비'가
-            # 감점 뒤에도 8위/9위를 오갔다. 지원대상 원문에 자격이 적힌 건은
-            # '맞춤'이라 부르지 않는다 — 목록에는 남고 섹션만 내려간다.
-            row["eligibility_excluded"] = True
-            excluded += 1
-    if demoted:
-        logger.info("[eligibility] 감점 %d건 (그중 맞춤 제외 %d건)", demoted, excluded)
-    return rows
+        kept.append(row)
+
+    if dropped or demoted:
+        logger.info("[eligibility] 제외 %d건 / 감점 %d건", len(dropped), demoted)
+    for note in dropped:
+        logger.debug("[eligibility] 제외: %s", note)
+    return kept

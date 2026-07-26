@@ -38,22 +38,38 @@ class CbState(TypedDict, total=False):
     household: Annotated[List[str], merge_tags]
     theme: Annotated[List[str], merge_tags]
 
+    # 상태·등급. 3종 필터와 달리 '해당한다'와 '해당하지 않는다'를 나눠 들고 있다.
+    #
+    # 해당하지 않는다는 답은 결과를 좁히는 데 곧바로 쓰인다. 반면 답을 안 했거나
+    # 모르는 것은 '해당하지 않음'이 아니다 — 두 경우가 섞이면 필요한 제도가
+    # 사라지므로 명시적으로 아니라고 한 것만 denied에 들어간다.
+    conditions: Annotated[List[str], merge_tags]
+    denied_conditions: Annotated[List[str], merge_tags]
+    # 상태·등급을 한 번 물었는가. 같은 질문을 두 번 하지 않기 위한 표시.
+    narrow_asked: bool
+
     # 지역은 누적 대상이 아니다. cb_user_profile에서 1회 복사한 뒤 고정이다.
     region_sgg: Optional[str]
 
-    # --- 초반에 먼저 확정하는 2가지 -------------------------------------------
-    # 자유대화로 넘어가기 전에 이 둘을 확인한다. 설문처럼 순서를 고정하지는
-    # 않고, 대화 중에 이미 나왔으면 묻지 않는다.
+    # --- 초반에 먼저 확정하는 것들 ---------------------------------------------
+    # 자유대화로 넘어가기 전에 확인한다. 설문처럼 순서를 고정하지는 않고,
+    # 대화 중에 이미 나왔으면 묻지 않는다.
     #
+    # 지금 필요한 도움이 누구를 위한 것인가: 'self' | 'caree'.
+    # 영케어러는 본인 것과 돌보는 분 것이 섞여 있어서, 이걸 모르면 검색이
+    # 엉뚱한 생애주기로 흐른다. 그래서 나이보다 이것을 먼저 확인한다.
+    target_for: Optional[str]
     # 본인 나이. 생애주기 태그로 바꿔 검색에 쓴다. 사용자가 끝내 말하지 않으면
     # None인 채로 진행한다 (나이를 캐물으면 대화가 심문이 된다).
     age: Optional[int]
-    # 지금 필요한 도움이 누구를 위한 것인가: 'self' | 'caree'.
-    # 영케어러는 본인 것과 돌보는 분 것이 섞여 있어서, 이걸 모르면 검색이
-    # 엉뚱한 생애주기로 흐른다.
-    target_for: Optional[str]
-    # 위 2가지를 물어본 횟수. 답을 피하는 사용자를 붙잡아 두지 않기 위한 상한.
+    # 돌보는 분의 연세. 돌봄 대상을 찾을 때는 이 나이가 생애주기를 정한다.
+    # 본인 나이로 대신할 수 없다 — 25살이 80대 아버지를 돌보는 경우가 이 서비스의 전형이다.
+    caree_age: Optional[int]
+    # 위 항목들을 물어본 횟수. 답을 피하는 사용자를 붙잡아 두지 않기 위한 상한.
     intake_asked: int
+    # 직전에 무엇을 물었는지. 같은 것을 두 번 물을 때 같은 문장을 되풀이하지
+    # 않기 위해서만 쓴다.
+    intake_last_asked: Optional[str]
 
     # 발화 그대로가 아니라 검색에 쓰기 좋게 정제한 문장.
     # 매 턴 새로 만든다 (누적하면 과거 관심사가 계속 섞여 검색이 흐려진다).
@@ -105,10 +121,13 @@ def initial_state(user_id: int, region_sgg: Optional[str] = None) -> CbState:
         user_id=user_id,
         messages=[],
         life_cycle=[], household=[], theme=[],
+        conditions=[], denied_conditions=[], narrow_asked=False,
         region_sgg=region_sgg,
-        age=None,
         target_for=None,
+        age=None,
+        caree_age=None,
         intake_asked=0,
+        intake_last_asked=None,
         query_text="",
         asked_followup=False,
         relaxed=False,

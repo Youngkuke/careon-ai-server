@@ -8,9 +8,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.cb import constants
 
-# 결과 화면에 쓸 검색 건수. 대화 중에는 검색을 아예 하지 않으므로
-# 이 한 번의 검색에서 두 구간을 모두 채운다.
-RESULT_LIMIT = 20
+# 검색에서 가져올 건수. 대화 중에는 검색을 아예 하지 않으므로 이 한 번의
+# 검색에서 두 구간을 모두 채운다.
+#
+# 화면에 나가는 건수보다 넉넉하다. 자격이 어긋나는 건이 eligibility에서
+# 빠지기 때문에(app/cb/eligibility.py), 딱 맞게 가져오면 걷어낸 만큼
+# 목록이 얇아진다.
+SEARCH_LIMIT = 30
+
+# '혹시 관심 있으실 수도'에 실을 최대 건수.
+#
+# 상한이 없을 때 이 섹션이 14~17건까지 나왔다. 그 정도면 읽지 않고 넘긴다.
+# 맞춤(최대 8건)과 합쳐 한 화면에서 훑을 수 있는 분량으로 끊는다.
+MAYBE_LIMIT = 8
 
 # --- 맞춤 / 혹시관심 구간 기준 ------------------------------------------------
 # score(RRF)로 절대 컷을 잡지 않는다. RRF는 순위 역수 합이라 유사도가 아니고,
@@ -124,16 +134,14 @@ def split_sections(rows: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
     maybe: List[Dict[str, Any]] = []
     for index, row in enumerate(rows, 1):
         card = to_card(row, rank=index)
-        # 지원대상 원문에 자격이 한정돼 있으면 '맞춤'이 아니다
-        # (app/cb/eligibility.py). 목록에서 빼지는 않는다.
-        fits = not row.get("eligibility_excluded")
-        if fits and index <= MATCHED_TOP_N and not _too_far(row.get("dist"), cutoff):
+        if index <= MATCHED_TOP_N and not _too_far(row.get("dist"), cutoff):
             matched.append(card)
         else:
             maybe.append(card)
 
     matched.sort(key=_distance_order)
-    return matched, maybe
+    # 혹시관심은 RRF 순서라 앞에서 자르는 것이 곧 '가장 가능성 있는 것부터'다.
+    return matched, maybe[:MAYBE_LIMIT]
 
 
 def _distance_order(card: Dict[str, Any]):

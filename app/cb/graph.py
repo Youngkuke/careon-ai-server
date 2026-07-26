@@ -2,8 +2,9 @@
 
     START ─┬─ 첫 진입(발화 없음) ──→ greet ──→ END              phase=gathering
            └─ 사용자 발화 ↓
-        extract_intent ─┬─ 나이/대상 미확인 ──→ ask_intake ──→ END  phase=gathering
+        extract_intent ─┬─ 대상/나이 미확인 ──→ ask_intake ──→ END  phase=gathering
                         ├─ 아직 부족 ────────→ converse ────→ END  phase=gathering
+                        ├─ 충분 & 등급 미확인 → ask_narrow ──→ END  phase=gathering
                         └─ 충분 ↓
                      search_institutions ─┬─ 0건 & 미완화 ──→ relax_filters ─┐
                                           │←──────────────────────────────────┘
@@ -71,10 +72,16 @@ def route_from_start(state: CbState) -> str:
 
 
 def route_after_intent(state: CbState) -> str:
-    """인테이크(나이·대상)를 먼저 끝내고, 그다음 대화/검색을 정한다."""
+    """인테이크(대상·나이)를 끝내고, 대화를 더 할지 검색으로 갈지 정한다.
+
+    검색으로 넘어가기 직전에 상태·등급을 한 번 확인한다. 이 질문은 대화를
+    한 턴 늘리지만, 안 물으면 자격이 안 맞는 제도가 결과의 절반을 차지한다.
+    """
     if not nodes.intake_done(state):
         return "ask_intake"
-    return "search_institutions" if nodes.is_ready(state) else "converse"
+    if not nodes.is_ready(state):
+        return "converse"
+    return "ask_narrow" if nodes.needs_narrow(state) else "search_institutions"
 
 
 def route_after_search(state: CbState) -> str:
@@ -91,6 +98,7 @@ def build_graph(checkpointer=None):
     builder.add_node("greet", nodes.greet)
     builder.add_node("extract_intent", nodes.extract_intent)
     builder.add_node("ask_intake", nodes.ask_intake)
+    builder.add_node("ask_narrow", nodes.ask_narrow)
     builder.add_node("converse", nodes.converse)
     builder.add_node("search_institutions", nodes.search_institutions)
     builder.add_node("relax_filters", nodes.relax_filters)
@@ -103,10 +111,11 @@ def build_graph(checkpointer=None):
     builder.add_edge("greet", END)
     builder.add_conditional_edges(
         "extract_intent", route_after_intent,
-        {"ask_intake": "ask_intake", "converse": "converse",
-         "search_institutions": "search_institutions"},
+        {"ask_intake": "ask_intake", "ask_narrow": "ask_narrow",
+         "converse": "converse", "search_institutions": "search_institutions"},
     )
     builder.add_edge("ask_intake", END)
+    builder.add_edge("ask_narrow", END)
     builder.add_edge("converse", END)
     builder.add_conditional_edges(
         "search_institutions", route_after_search,
@@ -246,7 +255,8 @@ async def run_turn(
         "relaxed_axes": result.get("relaxed_axes") or [],
         # 건수만. 카드는 결과 API에서만 나간다.
         "result_summary": result.get("result_summary") or None,
-        # 초반 2가지. 프론트가 진행 상태를 보여줄 수 있게 함께 내려준다.
-        "age": result.get("age"),
+        # 초반에 확정하는 것들. 프론트가 진행 상태를 보여줄 수 있게 함께 내려준다.
         "target_for": result.get("target_for"),
+        "age": result.get("age"),
+        "caree_age": result.get("caree_age"),
     }

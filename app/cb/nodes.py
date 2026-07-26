@@ -38,14 +38,34 @@ _INTENT_SCHEMA = {
             "type": "array",
             "items": {"type": "string", "enum": constants.THEME_TAGS},
         },
+        # 상태·등급. 해당한다고 밝힌 것과, 아니라고 밝힌 것을 나눠서 받는다.
+        # 답하지 않은 것은 어느 쪽에도 넣지 않는다 (모름 ≠ 해당 없음).
+        "conditions": {
+            "type": "array",
+            "items": {"type": "string", "enum": constants.CONDITION_TAGS},
+        },
+        "denied_conditions": {
+            "type": "array",
+            "items": {"type": "string", "enum": constants.CONDITION_TAGS},
+        },
         "query_text": {"type": "string"},
         "ready": {"type": "boolean"},
-        # 초반에 확정할 2가지. 아직 모르면 null이다.
+        # 초반에 확정할 것들. 아직 모르면 null이다.
         "age": {"type": ["integer", "null"]},
+        "caree_age": {"type": ["integer", "null"]},
         "target_for": {"type": ["string", "null"], "enum": constants.TARGET_FOR_VALUES + [None]},
+        # target_for의 근거가 된 사용자 발화 구절. 없으면 빈 문자열.
+        #
+        # 이 필드가 없을 때 LLM은 근거 없이 self를 채웠다. 실측(2026-07-27)에서
+        # "25살이요"라는 나이 답변만으로 대상=self가 확정됐고, 바로 다음 턴에
+        # "아버지가 거동이 불편하신데 돌봄이 고민이에요"가 와도 뒤집히지 않아
+        # 아버지 돌봄 상담 내내 검색이 본인 기준으로 돌았다.
+        # 근거를 함께 내놓게 하면 추측이 눈에 보이고, 코드가 걸러낼 수 있다.
+        "target_for_evidence": {"type": "string"},
     },
-    "required": ["life_cycle", "household", "theme", "query_text", "ready",
-                 "age", "target_for"],
+    "required": ["life_cycle", "household", "theme",
+                 "conditions", "denied_conditions", "query_text", "ready",
+                 "age", "caree_age", "target_for", "target_for_evidence"],
     "additionalProperties": False,
 }
 
@@ -53,9 +73,10 @@ _INTENT_SCHEMA = {
 # 되묻기가 길어지면 사용자는 답만 계속 하고 결과를 못 본다.
 MAX_USER_TURNS = 6
 
-# 나이/대상을 물어볼 수 있는 최대 횟수. 답을 피하는 사람을 붙잡아 두지 않는다.
-# 두 항목이니 각 1회씩이면 충분하다.
-MAX_INTAKE_QUESTIONS = 2
+# 대상/나이를 물어볼 수 있는 최대 횟수. 답을 피하는 사람을 붙잡아 두지 않는다.
+# 본인만 찾을 때는 2가지(대상·본인 나이), 돌보는 분을 찾을 때는 3가지
+# (+돌보는 분 연세)라 상한을 3으로 둔다. self로 끝나는 대화는 2회에서 멈춘다.
+MAX_INTAKE_QUESTIONS = 3
 
 # 첫 인사. LLM을 부르지 않는다 — 아직 아무 정보가 없어서 LLM이 더 나은 문장을
 # 만들 수 없고, 앱을 열자마자 2~3초를 기다리게 할 이유도 없다.
@@ -96,16 +117,20 @@ def _known_block(state: CbState) -> str:
     }.get(state.get("target_for") or "", "(아직 모름)")
     lines = [
         "[이미 확보한 정보]",
-        "본인 나이: %s" % (state.get("age") or "(아직 모름)"),
         "도움의 대상: %s" % target,
+        "본인 나이: %s" % (state.get("age") or "(아직 모름)"),
+        "돌보는 분 연세: %s" % (state.get("caree_age") or "(아직 모름)"),
         "생애주기: %s" % (", ".join(filters["life_cycle"]) or "(없음)"),
         "가구상황: %s" % (", ".join(filters["household"]) or "(없음)"),
         "관심주제: %s" % (", ".join(filters["theme"]) or "(없음)"),
+        "해당한다고 밝힌 자격: %s" % (", ".join(state.get("conditions") or []) or "(없음)"),
+        "해당 없다고 밝힌 자격: %s" % (", ".join(state.get("denied_conditions") or []) or "(없음)"),
         "",
         "[고를 수 있는 값]",
         "생애주기: %s" % ", ".join(constants.LIFE_CYCLE_TAGS),
         "가구상황: %s" % ", ".join(constants.HOUSEHOLD_TAGS),
         "관심주제: %s" % ", ".join(constants.THEME_TAGS),
+        "상태·등급: %s" % ", ".join(constants.CONDITION_TAGS),
     ]
     return "\n".join(lines)
 
@@ -151,49 +176,85 @@ async def extract_intent(state: CbState) -> Dict[str, Any]:
         kind: constants.filter_to_vocabulary(raw.get(kind) or [], kind)
         for kind in ("life_cycle", "household", "theme")
     }
+    for kind in ("conditions", "denied_conditions"):
+        update[kind] = [v for v in (raw.get(kind) or [])
+                        if v in constants.CONDITION_TAGS]
+    # 같은 항목이 양쪽에 다 들어오면 '해당한다'를 믿는다. 해당하는데 아니라고
+    # 읽으면 필요한 제도가 사라지지만, 반대는 목록이 조금 길어질 뿐이다.
+    if update["conditions"]:
+        update["denied_conditions"] = [v for v in update["denied_conditions"]
+                                       if v not in update["conditions"]]
     query_text = (raw.get("query_text") or "").strip()
     update["query_text"] = query_text or _last_user_text(state)
     update["ready"] = bool(raw.get("ready"))
 
-    # 나이와 대상은 '한 번 확정되면 덮어쓰지 않는다'. 뒤 턴에서 LLM이 null을
-    # 돌려줘도(대화 주제가 옮겨가면 흔히 그렇다) 이미 알아낸 값이 지워지면
-    # 같은 걸 또 묻게 된다.
-    target_for = raw.get("target_for")
-    if target_for in constants.TARGET_FOR_VALUES and state.get("target_for") is None:
+    target_for = _grounded_target(raw, state)
+    if target_for is not None:
         update["target_for"] = target_for
-    # 이번 턴에 새로 나온 값이 없으면 이미 확정된 값을 본다. LLM은 화제가
-    # 옮겨가면 target_for를 null로 돌려주는데, 그걸 '본인 것'으로 읽으면
-    # 돌봄 대상을 찾는 중에도 본인 생애주기가 붙는다.
-    effective_target = update.get("target_for") or state.get("target_for")
+    # 이번 턴에 새로 나온 값이 없으면 이미 확정된 값을 본다.
+    effective_target = target_for or state.get("target_for")
 
+    # 나이는 '한 번 확정되면 덮어쓰지 않는다'. 뒤 턴에서 LLM이 null을 돌려줘도
+    # (대화 주제가 옮겨가면 흔히 그렇다) 이미 알아낸 값이 지워지면 또 묻게 된다.
+    bands: List[str] = []
     age = _valid_age(raw.get("age"))
     if age is not None and state.get("age") is None:
         update["age"] = age
-        # 나이를 알면 생애주기가 확정된다. 본인 것을 찾는 경우에만 붙인다 —
-        # 돌보는 분을 찾는 중이라면 본인 나이는 검색 대상이 아니다.
-        if effective_target != constants.TARGET_CAREE:
-            band = constants.life_cycle_for_age(age)
-            if band:
-                update["life_cycle"] = merge_tags(update.get("life_cycle"), [band])
+    caree_age = _valid_age(raw.get("caree_age"))
+    if caree_age is not None and state.get("caree_age") is None:
+        update["caree_age"] = caree_age
 
-    if effective_target == constants.TARGET_CAREE:
-        # 돌보는 분을 찾는 중인데 본인 생애주기가 새로 끼어드는 것을 막는다.
-        # 프롬프트로도 막아두었지만, 나이를 밝힌 턴에서 LLM이 습관적으로
-        # 본인 생애주기를 함께 넣는 일이 실제로 반복됐다.
-        own_band = constants.life_cycle_for_age(update.get("age") or state.get("age"))
-        if own_band and own_band in (update.get("life_cycle") or []):
-            # 이번 턴에 새로 들어오는 것만 막는다. 앞 턴에서 이미 누적된 태그는
-            # reducer가 합집합으로 들고 있고, 사용자가 말한 사실이라 지우지 않는다.
-            update["life_cycle"] = [t for t in update["life_cycle"] if t != own_band]
-            logger.info("[intent] 돌봄 대상 문맥이라 본인 생애주기(%s)는 넣지 않는다", own_band)
+    # 나이를 알면 생애주기가 확정된다. 본인과 돌보는 분의 생애주기를 **둘 다** 넣는다.
+    #
+    # 전에는 돌봄 대상을 찾는 중이면 본인 생애주기를 일부러 뺐다. 그랬더니
+    # 아버지 돌봄 상담에서 life_cycle=[노년]만 남아 결과 20건이 전부 노인
+    # 의료 제도가 되고, 정작 '가족돌봄청년 자기돌봄비' 같은 본인용 제도가
+    # 한 건도 나오지 않았다. 영케어러는 양쪽이 다 필요하다.
+    for value in (update.get("age") or state.get("age"),
+                  update.get("caree_age") or state.get("caree_age")):
+        band = constants.life_cycle_for_age(value)
+        if band:
+            bands.append(band)
+    if bands:
+        update["life_cycle"] = merge_tags(update.get("life_cycle"), bands)
 
-    logger.info("[intent] 신규태그=%s query=%r ready=%s age=%s 대상=%s",
+    logger.info("[intent] 신규태그=%s query=%r ready=%s age=%s 돌봄대상연세=%s 대상=%s",
                 {k: v for k, v in update.items()
                  if k in ("life_cycle", "household", "theme") and v},
                 update["query_text"][:40], update["ready"],
                 update.get("age", state.get("age")),
-                update.get("target_for", state.get("target_for")))
+                update.get("caree_age", state.get("caree_age")),
+                effective_target or "미상")
     return update
+
+
+def _grounded_target(raw: Dict[str, Any], state: CbState) -> Optional[str]:
+    """근거가 있을 때만 도움의 대상을 확정하고, 근거가 있으면 갱신도 허용한다.
+
+    두 가지를 동시에 막는다.
+
+      1) 근거 없는 확정. LLM은 나이만 답한 턴에도 습관적으로 self를 채운다.
+         근거 구절이 비어 있으면 아직 모르는 것으로 둔다 (그래야 ask_intake가 묻는다).
+      2) 확정 뒤 못 바꾸는 문제. 대화 도중 "아버지 돌봄이 고민"으로 화제가
+         옮겨가면 대상은 실제로 바뀐다. 근거가 새로 있으면 갱신한다.
+
+    갱신에 근거를 요구하므로, 화제가 옮겨갈 때 LLM이 null을 돌려주는 것만으로는
+    확정된 값이 지워지지 않는다.
+    """
+    target_for = raw.get("target_for")
+    if target_for not in constants.TARGET_FOR_VALUES:
+        return None
+
+    evidence = (raw.get("target_for_evidence") or "").strip()
+    current = state.get("target_for")
+    if not evidence:
+        if current is None:
+            logger.info("[intent] 대상=%s 은 근거가 없어 확정하지 않는다", target_for)
+        return None
+
+    if current is not None and current != target_for:
+        logger.info("[intent] 대상 갱신 %s → %s (근거=%r)", current, target_for, evidence[:30])
+    return target_for
 
 
 def _valid_age(value: Any) -> Optional[int]:
@@ -207,9 +268,26 @@ def _valid_age(value: Any) -> Optional[int]:
     return value if 0 < value <= 120 else None
 
 
+def missing_intake(state: CbState) -> Optional[str]:
+    """이번에 확인할 차례인 항목. 다 확인했으면 None.
+
+    대상을 가장 먼저 확인한다. 의료·돌봄 이야기가 나왔을 때 그게 본인 것인지
+    돌보는 분 것인지에 따라 찾아야 할 제도가 통째로 갈리기 때문이다.
+    나이를 먼저 물으면, 나이 답변에서 LLM이 대상을 넘겨짚고 넘어가버린다.
+    """
+    if state.get("target_for") is None:
+        return "target_for"
+    if state.get("age") is None:
+        return "age"
+    # 돌보는 분을 찾는 중이라면 그분의 연세가 생애주기를 정한다.
+    if state.get("target_for") == constants.TARGET_CAREE and state.get("caree_age") is None:
+        return "caree_age"
+    return None
+
+
 def intake_done(state: CbState) -> bool:
-    """초반 2가지(나이·대상)를 확인했거나, 물어볼 만큼 물어봤는가."""
-    if state.get("age") is not None and state.get("target_for") is not None:
+    """초반 확인이 끝났거나, 물어볼 만큼 물어봤는가."""
+    if missing_intake(state) is None:
         return True
     return int(state.get("intake_asked") or 0) >= MAX_INTAKE_QUESTIONS
 
@@ -232,20 +310,39 @@ async def greet(state: CbState) -> Dict[str, Any]:
             "phase": "gathering"}
 
 
+# 이번 턴에 무엇을 확인할지 LLM에게 알려주는 문구, 그리고 생성이 실패했을 때
+# 대신 내보낼 고정 질문.
+_INTAKE_ASK = {
+    "target_for": "지금 찾는 도움이 본인을 위한 것인지, 돌보는 분을 위한 것인지",
+    "age": "본인 나이",
+    "caree_age": "돌보시는 분의 연세",
+}
+_INTAKE_FALLBACK = {
+    "target_for": "지금 찾으시는 건 본인을 위한 건가요, 아니면 돌보시는 분을 위한 건가요?",
+    "age": "실례지만 나이가 어떻게 되세요?",
+    "caree_age": "돌보시는 분은 연세가 어떻게 되세요?",
+}
+
+
 async def ask_intake(state: CbState) -> Dict[str, Any]:
-    """자유대화로 넘어가기 전에 나이와 대상을 확인한다.
+    """자유대화로 넘어가기 전에 대상과 나이를 확인한다.
 
     설문이 아니다. 한 턴에 하나만, 지금까지의 대화에 이어붙여서 묻는다.
     (딱딱한 순서로 물으면 기존 phase1~5 챗봇과 같아진다.)
     """
-    missing = "age" if state.get("age") is None else "target_for"
+    missing = missing_intake(state) or "age"
     messages = [
         {"role": "system", "content": prompts.load("intake")},
         {"role": "system", "content": _known_block(state)},
-        {"role": "system", "content": "[이번 턴에 확인할 것] %s" % (
-            "본인 나이" if missing == "age" else
-            "지금 찾는 도움이 본인을 위한 것인지, 돌보는 분을 위한 것인지")},
-    ] + _history(state)
+        {"role": "system", "content": "[이번 턴에 확인할 것] %s" % _INTAKE_ASK[missing]},
+    ]
+    if state.get("intake_last_asked") == missing:
+        # 사용자가 답하지 않고 다른 이야기를 했다. 같은 문장을 되풀이하면
+        # 대화가 막힌 것처럼 보인다.
+        messages.append({"role": "system", "content":
+                         "[주의] 이미 한 번 물었다. 앞의 문장을 반복하지 말고 "
+                         "훨씬 짧게 한 번만 더 권한 뒤, 몰라도 괜찮다고 덧붙여라."})
+    messages += _history(state)
 
     try:
         resp = await embedding.with_retry(
@@ -262,12 +359,77 @@ async def ask_intake(state: CbState) -> Dict[str, Any]:
         text = ""
 
     if not text:
-        text = ("실례지만 나이가 어떻게 되세요?" if missing == "age" else
-                "지금 찾으시는 건 본인을 위한 건가요, 아니면 돌보시는 분을 위한 건가요?")
+        text = _INTAKE_FALLBACK[missing]
 
     asked = int(state.get("intake_asked") or 0) + 1
     logger.info("[intake] %s 확인 질문 (%d/%d)", missing, asked, MAX_INTAKE_QUESTIONS)
-    return {"answer": text, "intake_asked": asked, "phase": "gathering"}
+    return {"answer": text, "intake_asked": asked, "intake_last_asked": missing,
+            "phase": "gathering"}
+
+
+# 상태·등급을 물을 만한 주제. 이 주제의 제도는 등급·수급 여부로 자격이
+# 갈리는 것이 많아서, 안 물으면 해당 없는 제도가 결과의 절반을 차지한다.
+# 주거·일자리 같은 주제까지 넓히지 않는다 — 그쪽은 되묻는 값이 작다.
+NARROW_THEMES = frozenset({"신체건강", "정신건강", "보호·돌봄"})
+
+
+def needs_narrow(state: CbState) -> bool:
+    """검색 직전에 상태·등급을 한 번 물어볼 차례인가.
+
+    딱 한 번만 묻는다. 대화가 끝나갈 때 던지는 질문이라 여기서 되묻기를
+    반복하면 결과를 못 보고 끝난다.
+    """
+    if state.get("narrow_asked"):
+        return False
+    # 이미 대화에서 나왔으면 물을 이유가 없다.
+    if state.get("conditions") or state.get("denied_conditions"):
+        return False
+    return bool(NARROW_THEMES & set(state.get("theme") or []))
+
+
+async def ask_narrow(state: CbState) -> Dict[str, Any]:
+    """검색 직전, 자격을 가르는 상태·등급을 한 번 확인한다.
+
+    "아프다"는 말 하나로 의료 제도 수백 건이 후보가 되는데, 그중 상당수는
+    장기요양등급이나 장애등록이 신청 조건이다. 이걸 모르면 해당 없는 제도를
+    함께 보여주게 되고, 사용자는 결국 목록을 직접 훑어야 한다.
+
+    진단명은 묻지 않는다. 사용자가 먼저 말하면 그때 검색어에 실린다.
+    """
+    for_caree = state.get("target_for") == constants.TARGET_CAREE
+    messages = [
+        {"role": "system", "content": prompts.load("narrow")},
+        {"role": "system", "content": _known_block(state)},
+        {"role": "system", "content": "[이번 턴에 확인할 것] %s의 장기요양등급 또는 장애등록 여부" % (
+            "돌보시는 분" if for_caree else "본인")},
+    ] + _history(state)
+
+    try:
+        resp = await embedding.with_retry(
+            lambda: embedding.client().chat.completions.create(
+                model=cb_settings.openai_model,
+                messages=messages,
+                temperature=0.4,
+            ),
+            label="narrow",
+        )
+        text = (resp.choices[0].message.content or "").strip()
+    except Exception:  # noqa: BLE001
+        logger.exception("[narrow] 생성 실패 — 고정 문구로 대체")
+        text = ""
+
+    if not text:
+        text = (
+            "찾기 전에 하나만 여쭤볼게요. 돌보시는 분이 장기요양등급이나 "
+            "장애 등록을 받으셨을까요? 아직이시거나 모르시면 그렇게만 알려주셔도 돼요."
+            if for_caree else
+            "찾기 전에 하나만 여쭤볼게요. 혹시 장애 등록이나 기초생활수급에 "
+            "해당되실까요? 아니거나 모르시면 그렇게만 알려주셔도 돼요."
+        )
+
+    logger.info("[narrow] 상태·등급 확인 질문 (대상=%s)",
+                "돌봄대상" if for_caree else "본인")
+    return {"answer": text, "narrow_asked": True, "phase": "gathering"}
 
 
 def user_turns(state: CbState) -> int:
@@ -292,6 +454,11 @@ def is_ready(state: CbState) -> bool:
     # 좌우해서, 모른 채로 찾으면 엉뚱한 대상의 제도가 올라온다.
     if not intake_done(state):
         return False
+    # 상태·등급까지 물어봤다면 그게 마지막 질문이었다. 사용자가 답한 턴에
+    # LLM이 ready를 다시 false로 돌려도(질문에 답한 직후엔 흔히 그렇다)
+    # 대화로 되돌아가지 않는다. 마지막이라고 해놓고 또 물으면 신뢰를 잃는다.
+    if state.get("narrow_asked"):
+        return True
     return bool(state.get("ready")) or user_turns(state) >= MAX_USER_TURNS
 
 
@@ -349,7 +516,7 @@ async def search_institutions(state: CbState) -> Dict[str, Any]:
         household=filters["household"] or None,
         theme=filters["theme"] or None,
         region_keys=region_keys,
-        limit=cards.RESULT_LIMIT,
+        limit=cards.SEARCH_LIMIT,
     )
     rows = _rerank(rows, state, query_text)
     logger.info(
@@ -367,11 +534,15 @@ def _rerank(rows: List[Dict[str, Any]], state: CbState,
     SQL은 태그와 유사도까지만 안다. '누구를 위해 찾는지'와 '사용자가 어떤
     자격을 밝혔는지'는 대화에만 있어서 여기서 반영한다.
     """
-    _apply_target_signal(rows, state.get("target_for"))
-    eligibility.apply(
+    _apply_target_signal(rows, state.get("target_for"),
+                         knows_caree=state.get("caree_age") is not None)
+    # 자격이 어긋나는 건은 여기서 목록에서 빠진다. 그래서 검색은 최종 노출
+    # 건수보다 넉넉히 가져온다 (cards.SEARCH_LIMIT).
+    rows = eligibility.apply(
         rows,
         user_text=" ".join([query_text] + _user_texts(state)),
         user_household=state.get("household") or [],
+        denied=state.get("denied_conditions") or [],
     )
     rows.sort(key=lambda r: (-(r.get("rrf") or 0.0),
                              r.get("dist") if r.get("dist") is not None else 9.0))
@@ -400,7 +571,8 @@ _CHILD_ONLY = frozenset({"영유아", "아동", "청소년"})
 
 
 def _apply_target_signal(rows: List[Dict[str, Any]],
-                         target_for: Optional[str]) -> List[Dict[str, Any]]:
+                         target_for: Optional[str],
+                         knows_caree: bool = False) -> List[Dict[str, Any]]:
     """도움의 대상이 어긋나는 제도를 뒤로 민다.
 
     영케어러는 본인 것과 돌보는 분 것을 함께 필요로 하므로 '청년 제도'를
@@ -408,7 +580,10 @@ def _apply_target_signal(rows: List[Dict[str, Any]],
     그래서 확실한 경우만 건드린다:
 
       - 돌보는 분을 찾는 중인데 영유아·아동·청소년 전용 제도인 경우
-      - 본인을 찾는 중인데 노년 전용 제도인 경우
+      - 본인을 찾는 중인데 노년 전용 제도인 경우.
+        단 돌보는 분의 연세를 알고 있으면(knows_caree) 건드리지 않는다.
+        본인 것을 우선하더라도 돌볼 어르신이 있다는 사실은 이미 확인됐고,
+        그때 노인 제도를 깎으면 정작 필요한 제도가 밀린다.
 
     둘 다 '전용'일 때만이다. 태그가 여러 생애주기에 걸쳐 있으면 손대지 않는다.
     """
@@ -419,10 +594,10 @@ def _apply_target_signal(rows: List[Dict[str, Any]],
         tags = set(row.get("life_cycle_tags") or [])
         if not tags:
             continue
-        mismatched = (
-            tags <= _CHILD_ONLY if target_for == constants.TARGET_CAREE
-            else tags == {"노년"}
-        )
+        if target_for == constants.TARGET_CAREE:
+            mismatched = tags <= _CHILD_ONLY
+        else:
+            mismatched = tags == {"노년"} and not knows_caree
         if mismatched:
             row["rrf"] = float(row.get("rrf") or 0.0) * TARGET_MISMATCH_FACTOR
             row["target_mismatch"] = True
