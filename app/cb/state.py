@@ -54,9 +54,23 @@ class CbState(TypedDict, total=False):
     # 사용자가 말한 사실은 검색이 0건이라고 해서 거짓이 되지 않는다.
     relaxed_axes: List[str]
 
+    # extract_intent가 매 턴 다시 판단하는 '이제 찾아봐도 되는가'.
+    # 누적하지 않는다 — 지난 턴에 켜졌다고 이번 턴도 켜져 있으면 안 된다.
+    ready: bool
+
     # --- 검색/답변 산출 ------------------------------------------------------
     candidates: List[Dict[str, Any]]
     answer: str
+
+    # gathering(대화 중) | ready(결과 준비됨). 프론트는 ready를 받으면
+    # 입력창을 잠그고 결과 화면으로 넘어간다.
+    phase: str
+
+    # wrap_up이 만들어 둔 결과 카드. 결과 API는 이걸 그대로 읽어 내려준다.
+    # 화면 전환 때 검색을 다시 돌리지 않기 위한 것이다 (임베딩+SQL 1회 절약,
+    # 그리고 대화 종료 시점과 결과가 어긋나지 않는다).
+    results: Dict[str, Any]
+    result_summary: Dict[str, Any]
 
 
 def active_filters(state: CbState) -> Dict[str, List[str]]:
@@ -82,8 +96,12 @@ def initial_state(user_id: int, region_sgg: Optional[str] = None) -> CbState:
         asked_followup=False,
         relaxed=False,
         relaxed_axes=[],
+        ready=False,
         candidates=[],
         answer="",
+        phase="gathering",
+        results={},
+        result_summary={},
     )
 
 

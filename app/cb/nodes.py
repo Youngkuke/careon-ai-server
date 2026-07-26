@@ -2,16 +2,22 @@
 
 노드는 State의 일부만 돌려준다. 병합은 LangGraph가 reducer로 처리한다
 (3종 필터는 state.merge_tags로 합집합 누적된다).
+
+대화 중에는 제도를 노출하지 않는다. 그래서 검색은 매 턴이 아니라 대화가
+끝나는 시점에 한 번만 돌린다. gathering 턴에는 임베딩도 SQL도 없다.
 """
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
-from app.cb import constants, embedding, prompts, search
+from app.cb import cards, constants, embedding, prompts, search
 from app.cb.config import cb_settings
-from app.cb.state import CbState, active_filters
+from app.cb.state import CbState, active_filters, has_any_filter
 
 logger = logging.getLogger(__name__)
+
+KST = timezone(timedelta(hours=9))
 
 # 대화 이력을 몇 턴까지 프롬프트에 넣을지.
 # 전부 넣으면 토큰이 계속 늘고, 오래된 화제가 query_text를 흐린다.
@@ -33,13 +39,15 @@ _INTENT_SCHEMA = {
             "items": {"type": "string", "enum": constants.THEME_TAGS},
         },
         "query_text": {"type": "string"},
+        "ready": {"type": "boolean"},
     },
-    "required": ["life_cycle", "household", "theme", "query_text"],
+    "required": ["life_cycle", "household", "theme", "query_text", "ready"],
     "additionalProperties": False,
 }
 
-# 검색 결과를 몇 건까지 답변에 쓸지. 너무 많으면 답변이 목록 나열이 된다.
-TOP_K = 5
+# 사용자 발화가 이만큼 쌓이면 더 묻지 않고 검색으로 넘어간다.
+# 되묻기가 길어지면 사용자는 답만 계속 하고 결과를 못 본다.
+MAX_USER_TURNS = 6
 
 # 0건일 때 푸는 순서. 가구상황을 먼저 푼다 —
 # '저소득' 같은 값은 사용자가 스치듯 말해도 붙는데, 제도 쪽은 명시적으로
@@ -112,7 +120,7 @@ async def extract_intent(state: CbState) -> Dict[str, Any]:
         raw = json.loads(resp.choices[0].message.content or "{}")
     except Exception:  # noqa: BLE001 — 추출 실패가 대화를 끊으면 안 된다
         logger.exception("[intent] 추출 실패 — 발화 원문으로 검색한다")
-        return {"query_text": _last_user_text(state)}
+        return {"query_text": _last_user_text(state), "ready": False}
 
     # enum으로 막아두긴 했지만 어휘 필터를 한 번 더 태운다.
     # strict 스키마가 지켜지지 않는 경우가 드물게 있고, 그때 CHECK 제약이
@@ -123,17 +131,44 @@ async def extract_intent(state: CbState) -> Dict[str, Any]:
     }
     query_text = (raw.get("query_text") or "").strip()
     update["query_text"] = query_text or _last_user_text(state)
+    update["ready"] = bool(raw.get("ready"))
 
-    logger.info("[intent] 신규태그=%s query=%r",
-                {k: v for k, v in update.items() if k != "query_text" and v},
-                update["query_text"][:40])
+    logger.info("[intent] 신규태그=%s query=%r ready=%s",
+                {k: v for k, v in update.items()
+                 if k not in ("query_text", "ready") and v},
+                update["query_text"][:40], update["ready"])
     return update
 
 
-async def ask_followup(state: CbState) -> Dict[str, Any]:
-    """무엇을 찾는지 아직 모를 때 한 번 되묻는다."""
+def user_turns(state: CbState) -> int:
+    """사용자가 지금까지 말한 횟수."""
+    return sum(
+        1 for m in (state.get("messages") or [])
+        if (getattr(m, "type", None) or getattr(m, "role", None)) in ("human", "user")
+    )
+
+
+def is_ready(state: CbState) -> bool:
+    """대화를 끝내고 검색으로 넘어갈 때인가.
+
+    LLM의 판단(ready)을 그대로 믿지 않고 두 가지를 덧댄다:
+      - 필터가 하나도 없으면 검색할 게 없다. 856건 중 아무거나 20건이 나온다.
+      - 턴이 길어지면 LLM이 계속 아니라고 해도 넘어간다. 되묻기만 반복하면
+        사용자는 답만 하고 결과를 못 본다.
+    """
+    if not has_any_filter(state):
+        return False
+    return bool(state.get("ready")) or user_turns(state) >= MAX_USER_TURNS
+
+
+async def converse(state: CbState) -> Dict[str, Any]:
+    """아직 정보가 부족할 때의 대화 턴.
+
+    제도를 한 건도 언급하지 않는다. 검색도 돌지 않는다 —
+    이 경로에는 임베딩 호출도 SQL도 없어서 응답이 빠르다.
+    """
     messages = [
-        {"role": "system", "content": prompts.load("followup")},
+        {"role": "system", "content": prompts.load("converse")},
         {"role": "system", "content": _known_block(state)},
     ] + _history(state)
 
@@ -144,18 +179,18 @@ async def ask_followup(state: CbState) -> Dict[str, Any]:
                 messages=messages,
                 temperature=0.4,   # 되묻는 말은 매번 똑같으면 기계적으로 들린다
             ),
-            label="followup",
+            label="converse",
         )
         text = (resp.choices[0].message.content or "").strip()
     except Exception:  # noqa: BLE001
-        logger.exception("[followup] 생성 실패 — 고정 문구로 대체")
+        logger.exception("[converse] 생성 실패 — 고정 문구로 대체")
         text = ""
 
     if not text:
         text = ("어떤 부분이 가장 힘드신가요? "
                 "주거비, 병원비, 일자리처럼 지금 가장 마음에 걸리는 걸 알려주시면 찾아볼게요.")
 
-    return {"answer": text, "asked_followup": True}
+    return {"answer": text, "asked_followup": True, "phase": "gathering"}
 
 
 async def search_institutions(state: CbState) -> Dict[str, Any]:
@@ -180,7 +215,7 @@ async def search_institutions(state: CbState) -> Dict[str, Any]:
         household=filters["household"] or None,
         theme=filters["theme"] or None,
         region_keys=region_keys,
-        limit=TOP_K,
+        limit=cards.RESULT_LIMIT,
     )
     logger.info(
         "[search] q=%r filters=%s region=%s → %d건",
@@ -205,96 +240,70 @@ async def relax_filters(state: CbState) -> Dict[str, Any]:
     return {"relaxed": True, "relaxed_axes": dropped}
 
 
-def _institution_block(rows: List[Dict[str, Any]]) -> str:
-    """검색 결과를 프롬프트에 넣을 텍스트로.
+def region_label_for_user(region_sgg: Any) -> str:
+    """마무리 멘트에 쓸 지역 표기.
 
-    본문을 통째로 넣으면 5건만 해도 수천 자가 되고, 정작 중요한 지원대상이
-    뒤로 밀린다. 필드별로 잘라서 넣는다.
+    자치구를 모르면 전국+서울시로만 검색하므로 멘트도 그대로 말한다.
+    모르는 걸 아는 척하면 사용자가 자기 동네 제도가 다 나온 줄 안다.
     """
-    parts: List[str] = []
-    for index, row in enumerate(rows, 1):
-        where = "전국" if row.get("region_scope") == "national" else (
-            row.get("sgg_nm") or row.get("ctpv_nm") or "지역")
-        lines = [
-            f"--- {index}. {row.get('serv_nm')} ({where}) ---",
-            f"요약: {(row.get('serv_dgst') or '').strip()[:300]}",
-        ]
-        for label, key, limit in (
-            ("지원대상", "target_detail", 400),
-            ("서비스내용", "service_content", 500),
-        ):
-            value = (row.get(key) or "").strip()
-            if value:
-                lines.append(f"{label}: {value[:limit]}")
-        tags = (row.get("life_cycle_tags") or []) + (row.get("theme_tags") or [])
-        if tags:
-            lines.append("분류: " + ", ".join(tags))
-        parts.append("\n".join(lines))
-    return "\n\n".join(parts)
+    sgg = (region_sgg or "").strip()
+    return sgg if sgg in constants.SEOUL_GU else "전국·서울시"
 
 
-def _situation_block(state: CbState) -> str:
-    filters = active_filters(state)
-    lines = ["[사용자 상황]"]
-    for label, key in (("생애주기", "life_cycle"), ("가구상황", "household"),
-                       ("관심주제", "theme")):
-        if filters[key]:
-            lines.append(f"{label}: {', '.join(filters[key])}")
-    if state.get("region_sgg"):
-        lines.append(f"거주지: 서울 {state['region_sgg']}")
-    if state.get("relaxed_axes"):
-        korean = {"household": "가구상황", "life_cycle": "생애주기"}
-        dropped = ", ".join(korean.get(a, a) for a in state["relaxed_axes"])
-        lines.append(
-            f"※ 조건에 딱 맞는 제도가 없어 {dropped} 조건을 빼고 다시 찾은 결과다. "
-            "답변에서 이 사실을 솔직히 알려라."
-        )
-    return "\n".join(lines)
+async def wrap_up(state: CbState) -> Dict[str, Any]:
+    """대화를 마치고 결과를 확정한다.
 
+    멘트는 고정 템플릿이다. LLM을 쓰면 2~3초가 더 붙는데, 화면 전환 직전
+    1~2초만 보이는 건수 보고 문구라 손해다.
 
-async def translate(state: CbState) -> Dict[str, Any]:
-    """검색 결과를 사용자 상황에 맞춘 대화체 답변 하나로 만든다.
-
-    제도별 개별 번역이 아니라 종합 답변 1회다. LLM 호출이 한 번이라 빠르고,
-    제도 간 우선순위와 비교를 말해줄 수 있다.
+    카드는 여기서 만들어 State에 넣어두고, 결과 API가 그대로 읽어간다.
+    화면 전환 때 검색을 다시 돌리지 않는다.
     """
     rows = state.get("candidates") or []
-    user_content = _situation_block(state)
-    if rows:
-        user_content += "\n\n[찾은 제도]\n" + _institution_block(rows)
+    label = region_label_for_user(state.get("region_sgg"))
+    matched, maybe = cards.split_sections(rows)
+
+    if not matched and not maybe:
+        # 0건이면 결과 화면으로 보내지 않는다. 빈 화면을 띄우는 것보다
+        # 대화를 이어가면서 조건을 더 받는 편이 낫다.
+        logger.info("[wrap_up] 0건 — 대화를 유지한다 (region=%s)", label)
+        return {
+            "answer": "조건에 맞는 제도를 찾지 못했어요. "
+                      "어떤 도움이 가장 필요하신지 조금만 더 알려주시겠어요?",
+            "phase": "gathering",
+            "results": {},
+            "result_summary": {},
+        }
+
+    if not matched:
+        # 전부 '혹시관심'으로 내려간 경우. 건수를 맞춤 기준으로 세면 "0건 찾았어요"가
+        # 되는데, 화면에는 카드가 있어서 말과 화면이 어긋난다.
+        message = (f"딱 맞는 제도는 못 찾았지만, {label} 기준으로 "
+                   f"관심 있으실 만한 걸 {len(maybe)}건 모아봤어요.")
+    elif state.get("relaxed_axes"):
+        message = (f"딱 맞는 건 없어서 조건을 조금 넓혔어요. "
+                   f"{label} 기준 {len(matched)}건이에요.")
     else:
-        user_content += "\n\n[찾은 제도]\n(없음 — 조건에 맞는 제도를 찾지 못했다)"
+        message = f"이제 다 확인했어요! {label} 기준으로 맞춤 제도 {len(matched)}건을 찾았어요."
 
-    messages = [
-        {"role": "system", "content": prompts.load("answer")},
-    ] + _history(state) + [
-        {"role": "user", "content": user_content},
-    ]
+    results = {
+        "generated_at": datetime.now(KST).isoformat(),
+        "region_sgg": state.get("region_sgg"),
+        "filters": active_filters(state),
+        "relaxed_axes": list(state.get("relaxed_axes") or []),
+        "matched": matched,
+        "maybe": maybe,
+    }
+    summary = {"matched": len(matched), "maybe": len(maybe), "region_label": label}
 
-    try:
-        resp = await embedding.with_retry(
-            lambda: embedding.client().chat.completions.create(
-                model=cb_settings.openai_model,
-                messages=messages,
-                temperature=0.3,
-            ),
-            label="answer",
-        )
-        text = (resp.choices[0].message.content or "").strip()
-    except Exception:  # noqa: BLE001 — 답변 생성 실패가 500으로 나가면 안 된다
-        logger.exception("[translate] 답변 생성 실패")
-        text = ""
-
-    if not text:
-        # LLM이 죽어도 검색 결과는 살아 있다. 제도명만이라도 돌려준다.
-        if rows:
-            names = ", ".join(r["serv_nm"] for r in rows[:3])
-            text = f"이런 제도를 찾았어요: {names}. 자세한 설명을 준비하는 데 문제가 있어 다시 시도해 주세요."
-        else:
-            text = "조건에 맞는 제도를 찾지 못했어요. 어떤 도움이 필요하신지 조금 더 알려주시겠어요?"
-
-    logger.info("[translate] 후보 %d건 → 답변 %d자", len(rows), len(text))
-    return {"answer": text}
+    logger.info("[wrap_up] 맞춤 %d건 / 혹시관심 %d건 (region=%s, 완화=%s)",
+                len(matched), len(maybe), label, state.get("relaxed_axes") or "없음")
+    return {
+        "answer": message,
+        "phase": "ready",
+        "results": results,
+        "result_summary": summary,
+    }
 
 
 def _last_user_text(state: CbState) -> str:

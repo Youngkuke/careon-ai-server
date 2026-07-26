@@ -229,10 +229,13 @@ async def main() -> int:
 
             session.turns += 1
             session.last = out
-            # /why 에서 쓰려고 질의문을 함께 보관한다.
+            # run_turn은 API 응답 모양(카드 없음)만 돌려준다. REPL은 디버깅용이라
+            # 검색 원본이 필요하므로 State에서 직접 꺼낸다.
             state = await graph.graph().aget_state(
                 {"configurable": {"thread_id": session.thread_id}})
-            session.last["query_text"] = (state.values or {}).get("query_text", "")
+            values = state.values or {}
+            session.last["query_text"] = values.get("query_text", "")
+            session.last["candidates"] = values.get("candidates") or []
 
             print()
             print(c("봇 > ", GREEN) + out["answer"])
@@ -241,15 +244,23 @@ async def main() -> int:
             filters = out["filters"]
             summary = " / ".join(
                 "%s=%s" % (k, ",".join(v)) for k, v in filters.items() if v) or "필터 없음"
-            found = len(out["candidates"])
             note = ""
             if out["relaxed_axes"]:
                 note = c("  [조건 완화: %s]" % ",".join(out["relaxed_axes"]), YELLOW)
-            print(c("  %s | 제도 %d건 | %.0fms" % (summary, found, elapsed), DIM) + note)
-            if found:
-                print(c("  → %s" % " · ".join(
-                    r["serv_nm"][:20] for r in out["candidates"][:3]), DIM))
-            print(c("  (/list 전체 · /why 순위근거 · /detail N 원문)", DIM))
+            phase = out["phase"]
+            counts = out.get("result_summary") or {}
+            state_text = (
+                "맞춤 %d건 / 혹시관심 %d건" % (counts.get("matched", 0), counts.get("maybe", 0))
+                if phase == "ready" else "대화 중"
+            )
+            print(c("  %s | %s | %.0fms" % (summary, state_text, elapsed), DIM) + note)
+            if phase == "ready":
+                results = values.get("results") or {}
+                for label, key in (("맞춤", "matched"), ("혹시관심", "maybe")):
+                    names = [card["name"][:20] for card in (results.get(key) or [])[:3]]
+                    if names:
+                        print(c("  %s → %s" % (label, " · ".join(names)), DIM))
+                print(c("  (/list 전체 · /why 순위근거 · /detail N 원문 · /new 다시 시작)", DIM))
             print()
     except KeyboardInterrupt:
         pass

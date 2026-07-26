@@ -1,11 +1,13 @@
 """LangGraph 그래프 조립 + Postgres checkpointer.
 
-    START → extract_intent ─┬─ 필터 0개 ──→ ask_followup ──→ END
+    START → extract_intent ─┬─ 아직 부족 ──→ converse ──→ END   phase=gathering
                             └─ 충분 ↓
                          search_institutions ─┬─ 0건 & 미완화 ──→ relax_filters ─┐
                                               │←──────────────────────────────────┘
                                               └─ 결과 있음 ↓
-                                            translate → END
+                                            wrap_up → END        phase=ready
+
+검색은 대화가 끝나는 시점에 한 번만 돈다. gathering 턴에는 임베딩도 SQL도 없다.
 
 checkpointer는 psycopg(동기 드라이버 계열의 async 구현)를 쓴다. 나머지 cb 코드는
 asyncpg를 쓰므로 Postgres 드라이버가 두 개 공존한다. langgraph 공식 구현을
@@ -22,7 +24,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from app.cb import nodes
 from app.cb.config import cb_settings
-from app.cb.state import CbState, has_any_filter
+from app.cb.state import CbState
 
 logger = logging.getLogger(__name__)
 
@@ -56,21 +58,15 @@ _checkpointer: Optional[AsyncPostgresSaver] = None
 
 # --- 분기 ---------------------------------------------------------------------
 def route_after_intent(state: CbState) -> str:
-    """필터가 하나도 없으면 한 번 되묻는다.
-
-    이미 되물었는데도 여전히 비어 있으면 그냥 검색한다. 두 번 연속 되물으면
-    사용자는 답을 못 얻고 질문만 받는다.
-    """
-    if not has_any_filter(state) and not state.get("asked_followup"):
-        return "ask_followup"
-    return "search_institutions"
+    """대화를 더 할지, 이제 찾아볼지 (판단 기준은 nodes.is_ready)."""
+    return "search_institutions" if nodes.is_ready(state) else "converse"
 
 
 def route_after_search(state: CbState) -> str:
     """0건이고 아직 완화 안 했으면 조건을 풀어 한 번 더."""
     if not state.get("candidates") and not state.get("relaxed"):
         return "relax_filters"
-    return "translate"
+    return "wrap_up"
 
 
 # --- 조립 ---------------------------------------------------------------------
@@ -78,24 +74,24 @@ def build_graph(checkpointer=None):
     builder = StateGraph(CbState)
 
     builder.add_node("extract_intent", nodes.extract_intent)
-    builder.add_node("ask_followup", nodes.ask_followup)
+    builder.add_node("converse", nodes.converse)
     builder.add_node("search_institutions", nodes.search_institutions)
     builder.add_node("relax_filters", nodes.relax_filters)
-    builder.add_node("translate", nodes.translate)
+    builder.add_node("wrap_up", nodes.wrap_up)
 
     builder.add_edge(START, "extract_intent")
     builder.add_conditional_edges(
         "extract_intent", route_after_intent,
-        {"ask_followup": "ask_followup", "search_institutions": "search_institutions"},
+        {"converse": "converse", "search_institutions": "search_institutions"},
     )
-    builder.add_edge("ask_followup", END)
+    builder.add_edge("converse", END)
     builder.add_conditional_edges(
         "search_institutions", route_after_search,
-        {"relax_filters": "relax_filters", "translate": "translate"},
+        {"relax_filters": "relax_filters", "wrap_up": "wrap_up"},
     )
     # 완화한 뒤에는 반드시 다시 검색한다. relaxed=True라 두 번 완화되지 않는다.
     builder.add_edge("relax_filters", "search_institutions")
-    builder.add_edge("translate", END)
+    builder.add_edge("wrap_up", END)
 
     return builder.compile(checkpointer=checkpointer)
 
@@ -183,11 +179,12 @@ async def run_turn(
     payload: Dict[str, Any] = {
         "user_id": user_id,
         "messages": [HumanMessage(content=message)],
-        # 매 턴 초기화해야 하는 것들. 지난 턴의 완화/되묻기 상태가 남으면
-        # 이번 턴이 엉뚱하게 동작한다.
+        # 매 턴 초기화해야 하는 것들. 지난 턴의 완화/종료 판단이 남으면
+        # 이번 턴이 엉뚱하게 동작한다 (특히 ready가 남으면 대화가 곧장 끝난다).
         "relaxed": False,
         "relaxed_axes": [],
         "asked_followup": False,
+        "ready": False,
     }
     if region_sgg is not None:
         payload["region_sgg"] = region_sgg
@@ -195,11 +192,13 @@ async def run_turn(
     result = await graph().ainvoke(payload, config)
     return {
         "answer": result.get("answer", ""),
-        "candidates": result.get("candidates") or [],
+        "phase": result.get("phase") or "gathering",
         "filters": {
             "life_cycle": result.get("life_cycle") or [],
             "household": result.get("household") or [],
             "theme": result.get("theme") or [],
         },
         "relaxed_axes": result.get("relaxed_axes") or [],
+        # 건수만. 카드는 결과 API에서만 나간다.
+        "result_summary": result.get("result_summary") or None,
     }
