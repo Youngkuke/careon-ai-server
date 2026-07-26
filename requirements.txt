@@ -2,7 +2,11 @@ fastapi==0.115.6
 uvicorn[standard]==0.32.1
 pydantic==2.10.4
 pydantic-settings==2.7.0
+# 기존 챗봇(app/llm.py)이 사용한다. 챗봇 검색엔진(app/cb)은 OpenAI만 쓴다.
 anthropic==0.117.0
+# 챗봇 검색엔진(app/cb) 전용
+openai==1.109.1
+httpx==0.28.1
 PyJWT==2.10.1
 asyncpg==0.30.0
 python-dotenv==1.0.1
