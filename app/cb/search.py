@@ -28,17 +28,19 @@ from app.cb import db, embedding
 
 # RRF 상수. 작을수록 상위권 순위차를 크게 본다.
 # 원논문 기본값은 60이지만 그건 수백만 건 코퍼스 기준이다. 856건 · 후보 120건
-# 규모에서 60은 1위와 20위의 차이를 거의 없애버린다. 20이 실측에서 가장 좋았다.
-RRF_K = 20
+# 규모에서 60은 1위와 20위의 차이를 거의 없애버린다. 10이 실측에서 가장 좋았다.
+RRF_K = 10
 
 # 두 신호의 상대 비중. 키워드를 벡터보다 높게 둔다.
 # 직관과 반대 같지만, 키워드는 '핵심어가 있을 때만' 점수를 준다 —
 # 질의에 변별력 있는 어휘가 없으면 아무 문서도 잡지 못하고 조용히 빠진다.
 # 그래서 비중을 높여도 벡터를 밀어내지 않고, 확실한 신호가 있을 때만 이긴다.
 #
-# 실측(10개 질의, 정답 순위): 벡터만 1위4건/5위내8건/평균4.7
-#                            lex0.8 k60  1위7건/5위내9건 /평균2.8
-#                            lex2.5 k20  1위7건/5위내10건/평균1.6  ← 채택
+# 실측(10개 질의, 정답 순위): 벡터만      1위4건/5위내8건 /평균4.7
+#                            lex0.8 k60  1위7건/5위내9건 /평균2.9
+#                            lex1.5 k20  1위8건/5위내9건 /평균1.8
+#                            lex2.5 k20  1위8건/5위내10건/평균1.3
+#                            lex2.5 k10  1위9건/5위내10건/평균1.1  ← 채택
 WEIGHT_VECTOR = 1.0
 WEIGHT_LEXICAL = 2.5
 
@@ -58,26 +60,38 @@ _MAX_TERMS = 24
 
 
 def candidate_terms(query: str) -> List[str]:
-    """질의에서 검색어 후보를 뽑는다.
+    """질의에서 검색어 후보를 뽑는다 (호출부 편의용 — 그룹 정보는 버린다)."""
+    return [term for term, _ in candidate_terms_grouped(query)]
+
+
+def candidate_terms_grouped(query: str) -> List[tuple]:
+    """(후보어, 원본 토큰 번호) 목록.
 
     조사/어미를 떼려고 접두 부분문자열을 함께 넣는다. 정확도는 IDF에 맡긴다.
+
+    같은 토큰에서 나온 후보어들은 '같은 그룹'으로 묶어서 점수를 한 번만 센다.
+    묶지 않으면 '도우미' 토큰이 '도우'와 '도우미' 두 후보어를 만들고, 둘이
+    같은 문서에 걸려 점수가 2배가 된다. 실제로 그 탓에
+    '출산 후 산모 도우미' 질의에서 '산림복지일자리(산림서비스도우미)'가
+    '산모·신생아 건강관리'를 눌러 1위가 됐다.
     """
-    terms: List[str] = []
-    for token in _TOKEN_RE.findall(query):
+    out: List[tuple] = []
+    seen = set()
+    for group, token in enumerate(_TOKEN_RE.findall(query)):
         if len(token) < 2:
             continue
-        stop = min(len(token), _MAX_PREFIX)
-        for size in range(2, stop + 1):
-            prefix = token[:size]
-            if prefix not in terms:
-                terms.append(prefix)
-        if len(token) > _MAX_PREFIX and token not in terms:
-            terms.append(token)
-    return terms[:_MAX_TERMS]
+        variants = [token[:size] for size in range(2, min(len(token), _MAX_PREFIX) + 1)]
+        if len(token) > _MAX_PREFIX:
+            variants.append(token)
+        for variant in variants:
+            if variant not in seen:
+                seen.add(variant)
+                out.append((variant, group))
+    return out[:_MAX_TERMS]
 
 
-# 고정 플레이스홀더($1~$8) 개수. 필터 인자는 이 뒤부터 번호를 받는다.
-_FIXED_ARGS = 8
+# 고정 플레이스홀더($1~$9) 개수. 필터 인자는 이 뒤부터 번호를 받는다.
+_FIXED_ARGS = 9
 
 
 def _filter_sql(
@@ -115,11 +129,11 @@ WITH base AS (
 ), total AS (
     SELECT GREATEST(count(*), 1)::float8 AS n FROM base
 ), term AS (
-    SELECT DISTINCT t AS term FROM unnest($2::TEXT[]) AS t
+    SELECT term, grp FROM unnest($2::TEXT[], $3::INT[]) AS t(term, grp)
 ), hit AS (
     -- 필드별 가중치: 제도명 3, 요약 2, 본문 1.
     -- 이름에 걸린 것이 본문 어딘가에 스친 것보다 훨씬 강한 신호다.
-    SELECT b.serv_id, t.term,
+    SELECT b.serv_id, t.term, t.grp,
            (CASE WHEN b.serv_nm ILIKE '%' || t.term || '%' THEN 3 ELSE 0 END
           + CASE WHEN coalesce(b.serv_dgst, '') ILIKE '%' || t.term || '%' THEN 2 ELSE 0 END
           + CASE WHEN coalesce(b.target_detail, '') ILIKE '%' || t.term || '%'
@@ -131,29 +145,33 @@ WITH base AS (
 ), weight AS (
     -- df=0(문서에 없는 후보어)과 너무 흔한 어휘는 0으로 죽인다.
     SELECT d.term,
-           CASE WHEN d.df = 0 OR d.df > total.n * $3 THEN 0
+           CASE WHEN d.df = 0 OR d.df > total.n * $4 THEN 0
                 ELSE ln(1 + total.n / d.df) END AS w
     FROM df d CROSS JOIN total
-), lexical AS (
-    SELECT h.serv_id, sum(h.field_score * w.w) AS score
+), per_group AS (
+    -- 같은 원본 토큰에서 나온 후보어들('도우', '도우미')은 최고점 하나만 센다.
+    -- 합치면 같은 단어를 두 번 세어 그 토큰이 부당하게 강해진다.
+    SELECT h.serv_id, h.grp, max(h.field_score * w.w) AS score
     FROM hit h JOIN weight w ON w.term = h.term
     WHERE h.field_score > 0 AND w.w > 0
-    GROUP BY h.serv_id
+    GROUP BY h.serv_id, h.grp
+), lexical AS (
+    SELECT serv_id, sum(score) AS score FROM per_group GROUP BY serv_id
 ), lex_rank AS (
     SELECT serv_id, row_number() OVER (ORDER BY score DESC, serv_id) AS rank, score
-    FROM lexical ORDER BY score DESC, serv_id LIMIT $4
+    FROM lexical ORDER BY score DESC, serv_id LIMIT $5
 ), vec_rank AS (
     SELECT serv_id, row_number() OVER (ORDER BY embedding <=> $1::vector, serv_id) AS rank,
            embedding <=> $1::vector AS dist
-    FROM base ORDER BY embedding <=> $1::vector, serv_id LIMIT $4
+    FROM base ORDER BY embedding <=> $1::vector, serv_id LIMIT $5
 ), fused AS (
     SELECT coalesce(v.serv_id, l.serv_id) AS serv_id,
            v.rank AS vec_rank, l.rank AS lex_rank, v.dist, l.score AS lex_score,
            -- ::float8 캐스트가 없으면 asyncpg가 파라미터를 bigint로 추론해
            -- 1/61 이 정수 나눗셈으로 0이 된다. RRF 전체가 0이 되어
            -- 결과가 조용히 '순수 벡터 순서'로 돌아간다.
-           coalesce($5::float8 / ($7::float8 + v.rank), 0)
-         + coalesce($6::float8 / ($7::float8 + l.rank), 0) AS rrf
+           coalesce($6::float8 / ($8::float8 + v.rank), 0)
+         + coalesce($7::float8 / ($8::float8 + l.rank), 0) AS rrf
     FROM vec_rank v FULL OUTER JOIN lex_rank l ON l.serv_id = v.serv_id
 )
 SELECT f.serv_id, f.vec_rank, f.lex_rank, f.dist, f.lex_score, f.rrf,
@@ -161,7 +179,7 @@ SELECT f.serv_id, f.vec_rank, f.lex_rank, f.dist, f.lex_score, f.rrf,
        i.life_cycle_tags, i.household_tags, i.theme_tags, i.detail_link
 FROM fused f JOIN cb.cb_institutions i ON i.serv_id = f.serv_id
 ORDER BY f.rrf DESC, f.dist NULLS LAST
-LIMIT $8
+LIMIT $9
 """
 
 
@@ -186,15 +204,17 @@ async def search(
     filter_args: List[Any] = []
     filters = _filter_sql(life_cycle, household, theme, region_keys, filter_args)
 
+    grouped = candidate_terms_grouped(query_text)
     args: List[Any] = [
-        literal,                    # $1 질의 벡터
-        candidate_terms(query_text),  # $2 후보 검색어
-        MAX_DF_RATIO,               # $3 흔한 어휘 컷오프
-        candidates,                 # $4 신호별 후보 개수
-        WEIGHT_VECTOR,              # $5
-        WEIGHT_LEXICAL,             # $6
-        float(RRF_K),               # $7
-        limit,                      # $8
+        literal,                        # $1 질의 벡터
+        [term for term, _ in grouped],  # $2 후보 검색어
+        [grp for _, grp in grouped],    # $3 후보어가 나온 원본 토큰 번호
+        MAX_DF_RATIO,                   # $4 흔한 어휘 컷오프
+        candidates,                     # $5 신호별 후보 개수
+        WEIGHT_VECTOR,                  # $6
+        WEIGHT_LEXICAL,                 # $7
+        float(RRF_K),                   # $8
+        limit,                          # $9
     ]
     args.extend(filter_args)        # $9 이후
 
