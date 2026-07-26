@@ -41,6 +41,20 @@ class CbState(TypedDict, total=False):
     # 지역은 누적 대상이 아니다. cb_user_profile에서 1회 복사한 뒤 고정이다.
     region_sgg: Optional[str]
 
+    # --- 초반에 먼저 확정하는 2가지 -------------------------------------------
+    # 자유대화로 넘어가기 전에 이 둘을 확인한다. 설문처럼 순서를 고정하지는
+    # 않고, 대화 중에 이미 나왔으면 묻지 않는다.
+    #
+    # 본인 나이. 생애주기 태그로 바꿔 검색에 쓴다. 사용자가 끝내 말하지 않으면
+    # None인 채로 진행한다 (나이를 캐물으면 대화가 심문이 된다).
+    age: Optional[int]
+    # 지금 필요한 도움이 누구를 위한 것인가: 'self' | 'caree'.
+    # 영케어러는 본인 것과 돌보는 분 것이 섞여 있어서, 이걸 모르면 검색이
+    # 엉뚱한 생애주기로 흐른다.
+    target_for: Optional[str]
+    # 위 2가지를 물어본 횟수. 답을 피하는 사용자를 붙잡아 두지 않기 위한 상한.
+    intake_asked: int
+
     # 발화 그대로가 아니라 검색에 쓰기 좋게 정제한 문장.
     # 매 턴 새로 만든다 (누적하면 과거 관심사가 계속 섞여 검색이 흐려진다).
     query_text: str
@@ -92,6 +106,9 @@ def initial_state(user_id: int, region_sgg: Optional[str] = None) -> CbState:
         messages=[],
         life_cycle=[], household=[], theme=[],
         region_sgg=region_sgg,
+        age=None,
+        target_for=None,
+        intake_asked=0,
         query_text="",
         asked_followup=False,
         relaxed=False,

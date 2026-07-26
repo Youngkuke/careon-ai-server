@@ -26,6 +26,29 @@ TAG_VOCABULARY: Dict[str, List[str]] = {
     "theme": THEME_TAGS,
 }
 
+# --- 도움의 대상 --------------------------------------------------------------
+# 영케어러는 본인 것(청년 주거·일자리)과 돌보는 분 것(노년 의료·돌봄)이 섞인다.
+# 어느 쪽을 찾는지 모르면 검색이 엉뚱한 생애주기로 흐른다.
+TARGET_SELF = "self"
+TARGET_CAREE = "caree"
+TARGET_FOR_VALUES: List[str] = [TARGET_SELF, TARGET_CAREE]
+
+# --- 나이 → 생애주기 ----------------------------------------------------------
+# 복지로 생애주기 구간에 맞춘 경계다. 제도마다 실제 연령 기준은 제각각이라
+# (청년월세는 19~34세, 청년 정책 일부는 39세까지) 이 값은 검색 태그를 고르는
+# 용도로만 쓴다. 자격 판정에 쓰면 안 된다.
+_AGE_BANDS = ((5, "영유아"), (12, "아동"), (18, "청소년"), (34, "청년"), (64, "중장년"))
+
+
+def life_cycle_for_age(age: Optional[int]) -> Optional[str]:
+    """나이 → 생애주기 태그 1개. 모르거나 값이 이상하면 None."""
+    if age is None or not 0 <= age <= 120:
+        return None
+    for upper, label in _AGE_BANDS:
+        if age <= upper:
+            return label
+    return "노년"
+
 # --- 서울 25개 자치구 ---------------------------------------------------------
 # region_scope 판정 기준. 이 목록에 정확히 일치할 때만 district다.
 SEOUL_GU: frozenset = frozenset([

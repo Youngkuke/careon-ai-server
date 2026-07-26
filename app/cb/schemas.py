@@ -88,13 +88,29 @@ class ResultSummary(BaseModel):
     region_label: str
 
 
+class Intake(BaseModel):
+    """자유대화 전에 먼저 확정하는 2가지. 아직 모르면 null이다."""
+
+    age: Optional[int] = None
+    target_for: Optional[str] = None     # self | caree
+
+
 class TurnResponse(BaseModel):
     thread_id: str
     phase: str                          # gathering | ready
     message: str
     filters: Filters
+    intake: Intake = Field(default_factory=Intake)
     # phase=gathering이면 항상 null이다.
     result_summary: Optional[ResultSummary] = None
+
+
+class ThreadStartResponse(BaseModel):
+    """대화를 열 때의 응답. 사용자가 먼저 말하지 않아도 봇이 인사를 건넨다."""
+
+    thread_id: str
+    phase: str = PHASE_GATHERING
+    message: str
 
 
 # --- 결과 화면 ----------------------------------------------------------------

@@ -2,6 +2,7 @@
 
 기존 /api/v1/chat 과 완전히 분리된 계약이다. 공유하는 것은 인증(JWT)뿐이다.
 
+  POST   /api/v1/cb/threads                         대화 시작 (봇이 먼저 인사)
   POST   /api/v1/cb/messages                        턴 진행
   DELETE /api/v1/cb/threads/{thread_id}             다시 시작
   GET    /api/v1/cb/threads/{thread_id}/results     결과 카드 (③에서 추가)
@@ -25,6 +26,7 @@ from app.cb.schemas import (
     Filters,
     InstitutionCard,
     InstitutionDetail,
+    Intake,
     MessageOnly,
     PHASE_GATHERING,
     PHASE_READY,
@@ -32,6 +34,7 @@ from app.cb.schemas import (
     ResultSection,
     ResultsResponse,
     ResultSummary,
+    ThreadStartResponse,
     TranslateResponse,
     TurnRequest,
     TurnResponse,
@@ -50,6 +53,21 @@ def require_cb() -> None:
     """
     if not cb_graph.ready():
         raise CbUnavailable()
+
+
+@router.post("/threads", response_model=ThreadStartResponse, status_code=201,
+             dependencies=[Depends(require_cb)])
+async def start_thread(
+    carer_id: int = Depends(get_current_carer_id),
+) -> ThreadStartResponse:
+    """대화 시작. 사용자가 첫 마디를 꺼내기 전에 봇이 먼저 인사한다.
+
+    화면을 열자마자 부르면 된다. 고정 인사말이라 LLM을 타지 않는다.
+    """
+    thread_id = threads.new_thread_id()
+    region_sgg = await cb_profile.region_sgg(carer_id)
+    result = await cb_graph.start_thread(thread_id, carer_id, region_sgg)
+    return ThreadStartResponse(thread_id=thread_id, message=result["answer"])
 
 
 @router.post("/messages", response_model=TurnResponse, dependencies=[Depends(require_cb)])
@@ -80,6 +98,7 @@ async def post_message(
         phase=result.get("phase") or PHASE_GATHERING,
         message=result.get("answer") or "",
         filters=Filters(**(result.get("filters") or {})),
+        intake=Intake(age=result.get("age"), target_for=result.get("target_for")),
         result_summary=ResultSummary(**summary) if summary else None,
     )
 

@@ -9,11 +9,11 @@
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.cb import cards, constants, embedding, prompts, search
 from app.cb.config import cb_settings
-from app.cb.state import CbState, active_filters, has_any_filter
+from app.cb.state import CbState, active_filters, has_any_filter, merge_tags
 
 logger = logging.getLogger(__name__)
 
@@ -40,14 +40,30 @@ _INTENT_SCHEMA = {
         },
         "query_text": {"type": "string"},
         "ready": {"type": "boolean"},
+        # 초반에 확정할 2가지. 아직 모르면 null이다.
+        "age": {"type": ["integer", "null"]},
+        "target_for": {"type": ["string", "null"], "enum": constants.TARGET_FOR_VALUES + [None]},
     },
-    "required": ["life_cycle", "household", "theme", "query_text", "ready"],
+    "required": ["life_cycle", "household", "theme", "query_text", "ready",
+                 "age", "target_for"],
     "additionalProperties": False,
 }
 
 # 사용자 발화가 이만큼 쌓이면 더 묻지 않고 검색으로 넘어간다.
 # 되묻기가 길어지면 사용자는 답만 계속 하고 결과를 못 본다.
 MAX_USER_TURNS = 6
+
+# 나이/대상을 물어볼 수 있는 최대 횟수. 답을 피하는 사람을 붙잡아 두지 않는다.
+# 두 항목이니 각 1회씩이면 충분하다.
+MAX_INTAKE_QUESTIONS = 2
+
+# 첫 인사. LLM을 부르지 않는다 — 아직 아무 정보가 없어서 LLM이 더 나은 문장을
+# 만들 수 없고, 앱을 열자마자 2~3초를 기다리게 할 이유도 없다.
+GREETING = (
+    "안녕하세요! 필요한 지원을 함께 찾아드릴게요.\n"
+    "요즘 어떤 부분이 가장 부담되세요? 월세나 집 문제, 병원비, 일자리처럼 "
+    "떠오르는 대로 편하게 말씀해 주세요."
+)
 
 # 0건일 때 푸는 순서. 가구상황을 먼저 푼다 —
 # '저소득' 같은 값은 사용자가 스치듯 말해도 붙는데, 제도 쪽은 명시적으로
@@ -74,8 +90,14 @@ def _history(state: CbState, turns: int = HISTORY_TURNS) -> List[Dict[str, str]]
 def _known_block(state: CbState) -> str:
     """이미 확보한 값을 알려줘서 같은 걸 또 묻거나 뒤집지 않게 한다."""
     filters = active_filters(state)
+    target = {
+        constants.TARGET_SELF: "본인",
+        constants.TARGET_CAREE: "돌보는 분",
+    }.get(state.get("target_for") or "", "(아직 모름)")
     lines = [
         "[이미 확보한 정보]",
+        "본인 나이: %s" % (state.get("age") or "(아직 모름)"),
+        "도움의 대상: %s" % target,
         "생애주기: %s" % (", ".join(filters["life_cycle"]) or "(없음)"),
         "가구상황: %s" % (", ".join(filters["household"]) or "(없음)"),
         "관심주제: %s" % (", ".join(filters["theme"]) or "(없음)"),
@@ -133,11 +155,119 @@ async def extract_intent(state: CbState) -> Dict[str, Any]:
     update["query_text"] = query_text or _last_user_text(state)
     update["ready"] = bool(raw.get("ready"))
 
-    logger.info("[intent] 신규태그=%s query=%r ready=%s",
+    # 나이와 대상은 '한 번 확정되면 덮어쓰지 않는다'. 뒤 턴에서 LLM이 null을
+    # 돌려줘도(대화 주제가 옮겨가면 흔히 그렇다) 이미 알아낸 값이 지워지면
+    # 같은 걸 또 묻게 된다.
+    target_for = raw.get("target_for")
+    if target_for in constants.TARGET_FOR_VALUES and state.get("target_for") is None:
+        update["target_for"] = target_for
+    # 이번 턴에 새로 나온 값이 없으면 이미 확정된 값을 본다. LLM은 화제가
+    # 옮겨가면 target_for를 null로 돌려주는데, 그걸 '본인 것'으로 읽으면
+    # 돌봄 대상을 찾는 중에도 본인 생애주기가 붙는다.
+    effective_target = update.get("target_for") or state.get("target_for")
+
+    age = _valid_age(raw.get("age"))
+    if age is not None and state.get("age") is None:
+        update["age"] = age
+        # 나이를 알면 생애주기가 확정된다. 본인 것을 찾는 경우에만 붙인다 —
+        # 돌보는 분을 찾는 중이라면 본인 나이는 검색 대상이 아니다.
+        if effective_target != constants.TARGET_CAREE:
+            band = constants.life_cycle_for_age(age)
+            if band:
+                update["life_cycle"] = merge_tags(update.get("life_cycle"), [band])
+
+    if effective_target == constants.TARGET_CAREE:
+        # 돌보는 분을 찾는 중인데 본인 생애주기가 새로 끼어드는 것을 막는다.
+        # 프롬프트로도 막아두었지만, 나이를 밝힌 턴에서 LLM이 습관적으로
+        # 본인 생애주기를 함께 넣는 일이 실제로 반복됐다.
+        own_band = constants.life_cycle_for_age(update.get("age") or state.get("age"))
+        if own_band and own_band in (update.get("life_cycle") or []):
+            # 이번 턴에 새로 들어오는 것만 막는다. 앞 턴에서 이미 누적된 태그는
+            # reducer가 합집합으로 들고 있고, 사용자가 말한 사실이라 지우지 않는다.
+            update["life_cycle"] = [t for t in update["life_cycle"] if t != own_band]
+            logger.info("[intent] 돌봄 대상 문맥이라 본인 생애주기(%s)는 넣지 않는다", own_band)
+
+    logger.info("[intent] 신규태그=%s query=%r ready=%s age=%s 대상=%s",
                 {k: v for k, v in update.items()
-                 if k not in ("query_text", "ready") and v},
-                update["query_text"][:40], update["ready"])
+                 if k in ("life_cycle", "household", "theme") and v},
+                update["query_text"][:40], update["ready"],
+                update.get("age", state.get("age")),
+                update.get("target_for", state.get("target_for")))
     return update
+
+
+def _valid_age(value: Any) -> Optional[int]:
+    """LLM이 돌려준 나이를 걸러낸다.
+
+    "몇 살쯤 되셨을까요"에 답을 안 했는데 추측해서 채우는 경우가 있고,
+    돌보는 분 나이를 본인 나이로 잘못 넣는 경우도 있다. 범위 밖 값은 버린다.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 < value <= 120 else None
+
+
+def intake_done(state: CbState) -> bool:
+    """초반 2가지(나이·대상)를 확인했거나, 물어볼 만큼 물어봤는가."""
+    if state.get("age") is not None and state.get("target_for") is not None:
+        return True
+    return int(state.get("intake_asked") or 0) >= MAX_INTAKE_QUESTIONS
+
+
+async def greet(state: CbState) -> Dict[str, Any]:
+    """대화를 열면서 봇이 먼저 건네는 인사.
+
+    사용자가 첫 마디를 꺼내야 봇이 반응하면, 무엇을 말해야 하는 화면인지
+    알기 어렵다. 인사와 함께 첫 질문을 같이 던진다.
+
+    고정 문구라 LLM도 DB도 타지 않는다. 응답이 즉시 돌아간다.
+    """
+    from langchain_core.messages import AIMessage
+
+    logger.info("[greet] 새 대화 시작 user=%s region=%s",
+                state.get("user_id"), state.get("region_sgg"))
+    # answer만 돌려주면 이 인사가 대화 이력에 남지 않아서, 다음 턴에 LLM이
+    # 자기가 무엇을 물었는지 모른다. messages에도 넣는다.
+    return {"answer": GREETING, "messages": [AIMessage(content=GREETING)],
+            "phase": "gathering"}
+
+
+async def ask_intake(state: CbState) -> Dict[str, Any]:
+    """자유대화로 넘어가기 전에 나이와 대상을 확인한다.
+
+    설문이 아니다. 한 턴에 하나만, 지금까지의 대화에 이어붙여서 묻는다.
+    (딱딱한 순서로 물으면 기존 phase1~5 챗봇과 같아진다.)
+    """
+    missing = "age" if state.get("age") is None else "target_for"
+    messages = [
+        {"role": "system", "content": prompts.load("intake")},
+        {"role": "system", "content": _known_block(state)},
+        {"role": "system", "content": "[이번 턴에 확인할 것] %s" % (
+            "본인 나이" if missing == "age" else
+            "지금 찾는 도움이 본인을 위한 것인지, 돌보는 분을 위한 것인지")},
+    ] + _history(state)
+
+    try:
+        resp = await embedding.with_retry(
+            lambda: embedding.client().chat.completions.create(
+                model=cb_settings.openai_model,
+                messages=messages,
+                temperature=0.4,
+            ),
+            label="intake",
+        )
+        text = (resp.choices[0].message.content or "").strip()
+    except Exception:  # noqa: BLE001
+        logger.exception("[intake] 생성 실패 — 고정 문구로 대체")
+        text = ""
+
+    if not text:
+        text = ("실례지만 나이가 어떻게 되세요?" if missing == "age" else
+                "지금 찾으시는 건 본인을 위한 건가요, 아니면 돌보시는 분을 위한 건가요?")
+
+    asked = int(state.get("intake_asked") or 0) + 1
+    logger.info("[intake] %s 확인 질문 (%d/%d)", missing, asked, MAX_INTAKE_QUESTIONS)
+    return {"answer": text, "intake_asked": asked, "phase": "gathering"}
 
 
 def user_turns(state: CbState) -> int:
@@ -157,6 +287,10 @@ def is_ready(state: CbState) -> bool:
         사용자는 답만 하고 결과를 못 본다.
     """
     if not has_any_filter(state):
+        return False
+    # 나이·대상을 아직 확인 중이면 검색하지 않는다. 이 둘이 생애주기를
+    # 좌우해서, 모른 채로 찾으면 엉뚱한 대상의 제도가 올라온다.
+    if not intake_done(state):
         return False
     return bool(state.get("ready")) or user_turns(state) >= MAX_USER_TURNS
 
@@ -217,11 +351,57 @@ async def search_institutions(state: CbState) -> Dict[str, Any]:
         region_keys=region_keys,
         limit=cards.RESULT_LIMIT,
     )
+    rows = _apply_target_signal(rows, state.get("target_for"))
     logger.info(
-        "[search] q=%r filters=%s region=%s → %d건",
-        query_text[:40], filters, state.get("region_sgg"), len(rows),
+        "[search] q=%r filters=%s region=%s 대상=%s → %d건",
+        query_text[:40], filters, state.get("region_sgg"),
+        state.get("target_for") or "미상", len(rows),
     )
     return {"candidates": rows}
+
+
+# 대상이 어긋나는 제도에 매길 감점 (rrf에 곱한다).
+# 빼지 않고 낮추기만 한다. 확실히 틀렸다고 단정할 수 없는 신호라서,
+# 사라지면 사용자가 찾을 방법이 없지만 내려가 있으면 아래에서 볼 수 있다.
+TARGET_MISMATCH_FACTOR = 0.7
+
+# 성인이 받을 수 없는 생애주기. 돌보는 분을 찾는 중일 때 이것'만' 달린 제도는
+# 대상이 어긋난다.
+_CHILD_ONLY = frozenset({"영유아", "아동", "청소년"})
+
+
+def _apply_target_signal(rows: List[Dict[str, Any]],
+                         target_for: Optional[str]) -> List[Dict[str, Any]]:
+    """도움의 대상이 어긋나는 제도를 뒤로 민다.
+
+    영케어러는 본인 것과 돌보는 분 것을 함께 필요로 하므로 '청년 제도'를
+    돌봄 문맥이라고 죽이면 안 된다 (가족돌봄청년 지원이 그렇게 사라진다).
+    그래서 확실한 경우만 건드린다:
+
+      - 돌보는 분을 찾는 중인데 영유아·아동·청소년 전용 제도인 경우
+      - 본인을 찾는 중인데 노년 전용 제도인 경우
+
+    둘 다 '전용'일 때만이다. 태그가 여러 생애주기에 걸쳐 있으면 손대지 않는다.
+    """
+    if target_for not in constants.TARGET_FOR_VALUES:
+        return rows
+
+    for row in rows:
+        tags = set(row.get("life_cycle_tags") or [])
+        if not tags:
+            continue
+        mismatched = (
+            tags <= _CHILD_ONLY if target_for == constants.TARGET_CAREE
+            else tags == {"노년"}
+        )
+        if mismatched:
+            row["rrf"] = float(row.get("rrf") or 0.0) * TARGET_MISMATCH_FACTOR
+            row["target_mismatch"] = True
+
+    # 감점했으면 순위가 달라진다. 다시 세운다.
+    rows.sort(key=lambda r: (-(r.get("rrf") or 0.0),
+                             r.get("dist") if r.get("dist") is not None else 9.0))
+    return rows
 
 
 async def relax_filters(state: CbState) -> Dict[str, Any]:

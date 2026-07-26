@@ -169,7 +169,21 @@ def start_over(client, session: Session) -> None:
     session.phase = "gathering"
     session.cards = []
     session.told_done = False
-    print(c("  새 대화를 시작합니다.\n", GREEN))
+    open_thread(client, session)
+
+
+def open_thread(client, session: Session) -> None:
+    """대화를 열고 봇의 첫 인사를 받는다. 사용자가 먼저 말하지 않아도 된다."""
+    r = client.post("/api/v1/cb/threads")
+    if r.status_code != 201:
+        print(c("  대화를 시작하지 못했습니다: %s %s" % (r.status_code, r.text[:200]), YELLOW))
+        return
+    data = r.json()
+    session.thread_id = data["thread_id"]
+    session.phase = data["phase"]
+    print()
+    print(c("봇 > ", GREEN) + data["message"])
+    print()
 
 
 def handle_command(client, session: Session, line: str) -> bool:
@@ -225,7 +239,12 @@ def send(client, session: Session, text: str) -> None:
     print(c("봇 > ", GREEN) + data["message"])
     filters = data["filters"]
     shown = " / ".join("%s=%s" % (k, ",".join(v)) for k, v in filters.items() if v)
-    print(c("  %s | %s | %.0fms" % (shown or "필터 없음", session.phase, elapsed), DIM))
+    intake = data.get("intake") or {}
+    known = "나이=%s 대상=%s" % (intake.get("age") or "?",
+                               {"self": "본인", "caree": "돌봄대상"}.get(
+                                   intake.get("target_for"), "?"))
+    print(c("  %s | %s | %s | %.0fms" % (
+        known, shown or "필터 없음", session.phase, elapsed), DIM))
     print()
 
     if session.phase == "ready":
@@ -255,7 +274,8 @@ def main() -> int:
     print(c("  서버를 준비하는 중...", DIM))
     with TestClient(app) as client:
         session = Session()
-        print(c("  준비 완료. carer_id=%d 로 대화합니다.\n" % args.user_id, DIM))
+        print(c("  준비 완료. carer_id=%d 로 대화합니다." % args.user_id, DIM))
+        open_thread(client, session)
         try:
             while True:
                 if session.phase == "ready" and not session.told_done:

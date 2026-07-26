@@ -1,11 +1,14 @@
 """LangGraph 그래프 조립 + Postgres checkpointer.
 
-    START → extract_intent ─┬─ 아직 부족 ──→ converse ──→ END   phase=gathering
-                            └─ 충분 ↓
-                         search_institutions ─┬─ 0건 & 미완화 ──→ relax_filters ─┐
-                                              │←──────────────────────────────────┘
-                                              └─ 결과 있음 ↓
-                                            wrap_up → END        phase=ready
+    START ─┬─ 첫 진입(발화 없음) ──→ greet ──→ END              phase=gathering
+           └─ 사용자 발화 ↓
+        extract_intent ─┬─ 나이/대상 미확인 ──→ ask_intake ──→ END  phase=gathering
+                        ├─ 아직 부족 ────────→ converse ────→ END  phase=gathering
+                        └─ 충분 ↓
+                     search_institutions ─┬─ 0건 & 미완화 ──→ relax_filters ─┐
+                                          │←──────────────────────────────────┘
+                                          └─ 결과 있음 ↓
+                                        wrap_up → END            phase=ready
 
 검색은 대화가 끝나는 시점에 한 번만 돈다. gathering 턴에는 임베딩도 SQL도 없다.
 
@@ -57,8 +60,20 @@ _checkpointer: Optional[AsyncPostgresSaver] = None
 
 
 # --- 분기 ---------------------------------------------------------------------
+def route_from_start(state: CbState) -> str:
+    """첫 진입이면 봇이 먼저 인사한다.
+
+    사용자 발화가 하나도 없는 상태로 들어오는 경로는 스레드 생성뿐이다
+    (graph.start_thread). 그때는 의도를 뽑을 대화가 없으므로 extract_intent를
+    태우면 LLM 호출만 낭비된다.
+    """
+    return "extract_intent" if nodes.user_turns(state) else "greet"
+
+
 def route_after_intent(state: CbState) -> str:
-    """대화를 더 할지, 이제 찾아볼지 (판단 기준은 nodes.is_ready)."""
+    """인테이크(나이·대상)를 먼저 끝내고, 그다음 대화/검색을 정한다."""
+    if not nodes.intake_done(state):
+        return "ask_intake"
     return "search_institutions" if nodes.is_ready(state) else "converse"
 
 
@@ -73,17 +88,25 @@ def route_after_search(state: CbState) -> str:
 def build_graph(checkpointer=None):
     builder = StateGraph(CbState)
 
+    builder.add_node("greet", nodes.greet)
     builder.add_node("extract_intent", nodes.extract_intent)
+    builder.add_node("ask_intake", nodes.ask_intake)
     builder.add_node("converse", nodes.converse)
     builder.add_node("search_institutions", nodes.search_institutions)
     builder.add_node("relax_filters", nodes.relax_filters)
     builder.add_node("wrap_up", nodes.wrap_up)
 
-    builder.add_edge(START, "extract_intent")
+    builder.add_conditional_edges(
+        START, route_from_start,
+        {"greet": "greet", "extract_intent": "extract_intent"},
+    )
+    builder.add_edge("greet", END)
     builder.add_conditional_edges(
         "extract_intent", route_after_intent,
-        {"converse": "converse", "search_institutions": "search_institutions"},
+        {"ask_intake": "ask_intake", "converse": "converse",
+         "search_institutions": "search_institutions"},
     )
+    builder.add_edge("ask_intake", END)
     builder.add_edge("converse", END)
     builder.add_conditional_edges(
         "search_institutions", route_after_search,
@@ -166,6 +189,28 @@ def checkpointer() -> AsyncPostgresSaver:
 
 
 # --- 실행 ---------------------------------------------------------------------
+async def start_thread(
+    thread_id: str,
+    user_id: int,
+    region_sgg: Optional[str] = None,
+) -> Dict[str, Any]:
+    """대화를 열고 봇의 첫 인사를 받는다. 사용자 발화 없이 호출한다."""
+    config = {"configurable": {"thread_id": thread_id}}
+    payload: Dict[str, Any] = {
+        "user_id": user_id,
+        "messages": [],
+        "age": None,
+        "target_for": None,
+        "intake_asked": 0,
+        "phase": "gathering",
+    }
+    if region_sgg is not None:
+        payload["region_sgg"] = region_sgg
+
+    result = await graph().ainvoke(payload, config)
+    return {"answer": result.get("answer", ""), "phase": "gathering"}
+
+
 async def run_turn(
     thread_id: str,
     user_id: int,
@@ -201,4 +246,7 @@ async def run_turn(
         "relaxed_axes": result.get("relaxed_axes") or [],
         # 건수만. 카드는 결과 API에서만 나간다.
         "result_summary": result.get("result_summary") or None,
+        # 초반 2가지. 프론트가 진행 상태를 보여줄 수 있게 함께 내려준다.
+        "age": result.get("age"),
+        "target_for": result.get("target_for"),
     }
