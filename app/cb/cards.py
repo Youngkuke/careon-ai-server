@@ -98,10 +98,22 @@ def to_card(row: Dict[str, Any], rank: Optional[int] = None) -> Dict[str, Any]:
 
 
 def split_sections(rows: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
-    """검색 결과를 (맞춤, 혹시관심)으로 나눈다. 둘 다 점수 내림차순이다.
+    """검색 결과를 (맞춤, 혹시관심)으로 나눈다.
 
-    rank는 나뉘기 전 전체 순위를 유지한다. 구간이 바뀌어도 같은 제도가 같은
-    번호를 갖고 있어야 실측할 때 로그와 응답을 맞춰볼 수 있다.
+    구간을 나누는 것은 RRF 순위이고, 맞춤 섹션 '안에서의 정렬'은 distance다.
+    두 척도가 다르기 때문에 섞으면 어긋난다. 실제로 벡터로만 걸린
+    '청소년특별지원'(거리 0.437)이 맞춤 1위(0.414) 다음으로 가까운데도 RRF
+    20위로 밀린 사례가 있었다. 키워드 가중치가 2.5, 벡터가 1.0이라 벡터 단독
+    건은 최대 1.0/(10+1)=0.0909밖에 못 받아 순위 경쟁에서 진다.
+
+    그래서 맞춤 섹션은 화면에 보일 때 거리 순으로 다시 세운다. 사용자가 가장
+    먼저 보는 자리는 '가장 가까운 것'이어야 한다.
+    혹시관심은 RRF 순서를 그대로 둔다 — 어차피 곁다리로 보는 목록이고,
+    거리로 다시 세우면 구간 경계에서 순서가 요동친다.
+
+    rank는 나뉘기 전 전체 RRF 순위를 유지한다(배열 순서와 다를 수 있다).
+    구간이 바뀌어도 같은 제도가 같은 번호를 갖고 있어야 실측할 때 로그와
+    응답을 맞춰볼 수 있다.
     """
     distances = [float(r["dist"]) for r in rows if r.get("dist") is not None]
     # 키워드로만 걸린 건은 거리가 없다. 그런 건만 있으면 상대 기준을 못 만들므로
@@ -116,7 +128,21 @@ def split_sections(rows: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
             matched.append(card)
         else:
             maybe.append(card)
+
+    matched.sort(key=_distance_order)
     return matched, maybe
+
+
+def _distance_order(card: Dict[str, Any]):
+    """맞춤 섹션 정렬 키: 가까운 것부터, 거리를 모르는 것은 맨 뒤.
+
+    거리가 없다는 건 벡터 후보군(search.CANDIDATES건) 안에도 못 들었다는
+    뜻이다. 키워드가 건져 올린 건이라 버리지는 않지만 의미상 가깝다는 근거는
+    없으므로 맨 앞자리를 주지 않는다. 그 안에서는 RRF 순위를 지킨다.
+    """
+    match = card.get("match") or {}
+    distance = match.get("distance")
+    return (1, match.get("rank") or 0) if distance is None else (0, distance)
 
 
 def _too_far(distance: Optional[float], cutoff: Optional[float]) -> bool:

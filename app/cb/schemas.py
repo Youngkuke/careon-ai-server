@@ -50,6 +50,9 @@ class MatchInfo(BaseModel):
     구간을 실측할 때는 distance(코사인 거리)를 쓴다.
     """
 
+    # 검색 전체에서의 RRF 순위. 맞춤 섹션은 화면에서 distance 순으로 다시
+    # 세우므로 배열 순서와 일치하지 않는다. 화면 번호는 배열 순서를 쓰고,
+    # 이 값은 로그와 응답을 맞춰볼 때 쓴다.
     rank: int
     score: float
     distance: Optional[float] = None    # 키워드로만 걸린 건은 벡터 거리가 없다
