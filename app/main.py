@@ -2,12 +2,13 @@
 import logging
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import db
 from app.cb import graph as cb_graph
 from app.config import settings
-from app.errors import ApiError, api_error_handler
+from app.errors import ApiError, api_error_handler, validation_error_handler
 from app.routers import cb, chat, policies
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -24,6 +25,9 @@ app.add_middleware(
 )
 
 app.add_exception_handler(ApiError, api_error_handler)
+# 스키마 검증 실패도 {error, message}로 내보낸다. 이것만 FastAPI 기본
+# {"detail": [...]}로 나가면 프론트 오류 파서가 여기서만 분기해야 한다.
+app.add_exception_handler(RequestValidationError, validation_error_handler)
 app.include_router(chat.router)
 app.include_router(policies.router)
 app.include_router(cb.router)

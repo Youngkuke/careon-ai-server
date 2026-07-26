@@ -1,5 +1,6 @@
 """API_SPEC 8번 공통 에러 포맷."""
 from fastapi import Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 
@@ -92,8 +93,63 @@ class DatabaseUnavailable(ApiError):
     default_message = "제도 정보를 조회할 수 없습니다. 서버 DB 연결을 확인해주세요."
 
 
+class ValidationFailed(ApiError):
+    """요청 본문/파라미터가 스키마에 안 맞는다.
+
+    FastAPI 기본 응답은 {"detail": [...]} 라서 우리 오류 형식과 다르다.
+    프론트 오류 파서가 이 한 가지 때문에 분기하지 않도록 형식만 맞춰준다.
+    상태 코드는 422 그대로 둔다 — 400(우리가 직접 던지는 잘못된 요청)과
+    구분되어야 서버 로그에서 '클라이언트가 계약을 어긴 요청'을 골라낼 수 있다.
+    """
+
+    status_code = 422
+    code = "VALIDATION_ERROR"
+    default_message = "요청 형식이 올바르지 않습니다."
+
+
+# pydantic의 영문 msg를 그대로 내보내면 사용자 화면에 영어가 뜬다.
+# 실제로 마주칠 만한 유형만 한국어로 옮기고 나머지는 기본 문구로 흡수한다.
+_VALIDATION_REASONS = {
+    "missing": "값이 필요합니다",
+    "string_type": "문자열이어야 합니다",
+    "int_type": "숫자여야 합니다",
+    "int_parsing": "숫자여야 합니다",
+}
+
+
+def _validation_message(exc: RequestValidationError) -> str:
+    """첫 번째 오류 하나만 문장으로. 전부 나열하면 말풍선이 길어진다."""
+    errors = exc.errors() if hasattr(exc, "errors") else []
+    if not errors:
+        return ValidationFailed.default_message
+
+    first = errors[0]
+    if first.get("type") == "json_invalid":
+        # 이때의 loc는 필드명이 아니라 깨진 위치의 문자 오프셋이라 쓸모가 없다.
+        return "요청 본문이 올바른 JSON이 아닙니다."
+
+    reason = _VALIDATION_REASONS.get(first.get("type", ""))
+    # loc 앞머리('body', 'query', ...)는 사용자에게 의미가 없다.
+    parts = [str(p) for p in (first.get("loc") or []) if p not in ("body", "query", "path")]
+    field = ".".join(parts)
+
+    if not field or not reason:
+        return ValidationFailed.default_message
+    return "{}: {}".format(field, reason)
+
+
 async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": exc.code, "message": exc.message},
     )
+
+
+async def validation_error_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """FastAPI의 RequestValidationError → 공통 오류 형식.
+
+    app/main.py에서 RequestValidationError 핸들러로 등록한다.
+    """
+    return await api_error_handler(request, ValidationFailed(_validation_message(exc)))
