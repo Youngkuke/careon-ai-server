@@ -26,6 +26,7 @@ A는 목록에서 뺀다. B는 순위만 낮춘다.
 그 그룹은 감점도 제외도 하지 않는다.
 """
 import logging
+import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from app.cb import grading
@@ -113,6 +114,185 @@ DENIABLE_GROUPS: Dict[str, Tuple[str, ...]] = {
     "차상위": ("차상위",),
 }
 
+# --- A-4. 좁은 질환에 게이트가 걸린 제도 ------------------------------------------
+# A-2(CONDITION_GROUPS)는 암·희귀난치·치매처럼 '넓은 카테고리'만 다룬다. 그보다
+# 좁은 단일 질환(백내장·요실금·탈모증·제1형 당뇨병…)은 사전에 없어서 그대로
+# 통과했다. 실측(2026-07-28): "치매+뇌졸중 후유증" 상담의 맞춤 구간에
+# 「노인 개안수술비 지원」과 「요실금 치료지원 사업」이 올라왔다.
+#
+# 왜 고정 목록을 만들지 않았는가
+#   질환명 목록은 끝이 없고 데이터가 늘면 계속 손봐야 한다. 대신 '이 제도가
+#   특정 진단을 자격으로 걸고 있는가'를 먼저 규칙으로 판정하고(게이트),
+#   질환어는 그 제도의 원문에서 그때그때 뽑는다. 목록을 들고 있지 않으므로
+#   새 제도가 들어와도 코드를 고칠 필요가 없다.
+#
+#   게이트를 먼저 거는 것이 핵심이다. 856건 전체에 '○○ 환자' 같은 문형을
+#   돌리면 「햇살론youth」의 "채무조정 성실상환자"가 '채무조정 성실상' 질환으로
+#   잡히는 식의 오탐이 쏟아진다. 게이트를 통과하는 19건 안에서는 그런 문장이
+#   나오지 않는다.
+#
+# 규모(2026-07-28 실측): 856건 중 게이트 통과 19건
+#   (진단요건 16 / 수술대상 4 / 상병코드 3, 중복 포함)
+_RE_DISEASE_GATE = re.compile(
+    r"상병\s*코드|질병\s*코드"          # ICD 코드를 나열하는 제도
+    r"|진단\s*(?:을|를)?\s*받|진단\s*기준|확진"   # 진단이 자격 요건인 제도
+    r"|수술\s*대상|대상\s*질환"          # 수술/대상질환을 명시하는 제도
+)
+
+# 게이트 표지 주변 이 범위에서만 질환어를 찾는다. 넓히면 자격과 무관한
+# 문장(지원 내용·문의처)까지 들어온다.
+_DISEASE_WINDOW = 70
+
+# 창 안에서 질환어를 집어내는 문형.
+#
+# 앞의 둘은 '대상 질환을 대놓고 열거한' 자리라 그대로 믿는다.
+# 뒤의 둘은 평범한 문장에서 뽑는 것이라 제도명 대조를 한 번 더 통과해야 한다
+# (_names_the_disease). 이 대조가 없으면 "출생 후 2년 **이내**에 ...으로
+# 진단받고"의 '이내', "**최종** 진단을 받은 병원에서"의 '최종'이 질환어로
+# 잡혀서 엉뚱한 제도가 내려간다.
+#
+# 괄호 열거만 무조건 믿는다. '수술대상(백내장, 망막질환, 녹내장)'처럼 대상 질환을
+# 대놓고 나열한 자리라 제도명에 그 병이 없어도(「노인 개안수술비 지원」) 근거가 된다.
+_RE_DISEASE_LISTS = [
+    re.compile(r"수술\s*대상\s*\(([^)]{2,80})\)"),
+]
+_RE_DISEASE_SENTENCES = [
+    # '(대상질환) ...' / '대상질환: ...'. 구분자를 요구한다 — 안 그러면
+    # 「희귀질환자 의료비 지원사업」의 "진단서를 통해 대상질환 확인- 관할부서에서
+    # 소득/재산조사"가 '재산조사'라는 질환으로 잡힌다.
+    re.compile(r"대상\s*질환\s*(?:\)|[:：])\s*([^)\n]{2,60})"),
+    re.compile(r"([가-힣A-Za-z0-9제·]{2,14})\s*(?:으로|로)?\s*진단"),
+    re.compile(r"([가-힣A-Za-z0-9제·]{2,14})\s*(?:환자|질환자|의심자|유병자)"),
+]
+
+_RE_TERM_SPLIT = re.compile(r"[,、·/]|\s등\s|\s및\s|\s또는\s")
+_RE_JOSA_TAIL = re.compile(r"(으로|로|을|를|이|가|은|는|의|에|와|과|및)$")
+
+# 포괄 표현. **이 목록만 하드코딩한다.** 질환명 목록과 달리 닫혀 있고 늘어나지
+# 않는다 — 복지 문서가 쓰는 상위 개념어는 사실상 고정이기 때문이다.
+# 여기 있는 말은 '좁은 질환'이 아니므로 감점 근거가 되지 못한다.
+_BROAD_TERMS: Set[str] = {
+    "질환", "질병", "상병", "중증", "중증질환", "만성", "만성질환", "희귀질환",
+    "희귀난치성질환", "희귀난치질환", "난치질환", "중증난치질환", "노인성질환",
+    "장애", "장애인", "등록장애인", "중증장애인", "경증장애인", "정신질환",
+    "노인", "어르신", "아동", "청소년", "영아", "신생아", "임산부", "산모",
+    "환자", "질환자", "대상자", "신청자", "본인", "가구원", "국민", "구민",
+    "저소득", "저소득층", "수급자", "차상위", "기타", "해당", "감염병",
+    "상병코드", "질병코드", "선별검사", "확진검사", "종합심리검사",
+    # 행정 용어. 자격 문장에 섞여 들어오는데 질환이 아니다.
+    "수술대상", "대상질환", "건강보험급여", "소득", "재산", "재산조사", "진단서",
+}
+
+
+def narrow_disease_terms(row: Dict[str, Any]) -> List[str]:
+    """제도가 자격으로 거는 '좁은 질환어'. 게이트를 통과하지 못하면 빈 목록.
+
+    선정기준까지 본다. 「성동구 청년 등 탈모 치료 지원」처럼 지원대상에는
+    거주·연령만 적고 진단 요건은 선정기준에 적는 제도가 있다.
+    선정기준이 없는 호출(컬럼을 안 읽은 경우)에도 그냥 동작한다.
+    """
+    text = " ".join(filter(None, [
+        row.get("serv_nm"), row.get("target_detail"), row.get("select_criteria"),
+    ]))
+    if not _RE_DISEASE_GATE.search(text):
+        return []
+
+    name = row.get("serv_nm") or ""
+    terms: List[str] = []
+    for marker in _RE_DISEASE_GATE.finditer(text):
+        start = max(0, marker.start() - _DISEASE_WINDOW)
+        window = text[start:marker.end() + _DISEASE_WINDOW]
+        for frames, trusted in ((_RE_DISEASE_LISTS, True),
+                                (_RE_DISEASE_SENTENCES, False)):
+            for frame in frames:
+                for match in frame.finditer(window):
+                    for chunk in _RE_TERM_SPLIT.split(match.group(1)):
+                        term = _clean_term(chunk)
+                        if not term or term in terms:
+                            continue
+                        if not trusted and not _names_the_disease(name, term):
+                            continue
+                        terms.append(term)
+    return terms
+
+
+def _names_the_disease(serv_nm: str, term: str) -> bool:
+    """제도명이 이 질환을 내걸고 있는가.
+
+    문장에서 뽑은 후보를 거르는 관문이다. 특정 질환에 게이트가 걸린 제도는
+    대개 이름에 그 병을 달고 있다(「요실금 치료지원 사업」, 「소아·청소년
+    제1형 당뇨병 환자 지원사업」). 이름에 없으면 감점 근거로 쓰지 않는다 —
+    놓치는 쪽이 멀쩡한 제도를 내리는 쪽보다 안전하다.
+
+    접두 부분문자열까지 인정한다. '탈모증'은 「성동구 청년 등 탈모 치료 지원」의
+    이름에 그대로는 없지만 '탈모'로 들어 있다 (search.py의 접두어 규칙과 같은 발상).
+    """
+    if term in serv_nm:
+        return True
+    return any(term[:size] in serv_nm for size in range(len(term) - 1, 1, -1))
+
+
+def _clean_term(raw: str) -> Optional[str]:
+    term = " ".join(raw.split()).strip(" ()[]<>·,.'\"")
+    term = _RE_JOSA_TAIL.sub("", term).strip()
+    if not (2 <= len(term) <= 14):
+        return None
+    if not re.search(r"[가-힣]", term):
+        return None
+    if term in _BROAD_TERMS:
+        return None
+    # 조사만 떼고 남은 동사·부사 꼬리를 걸러낸다 ('필요로 하', '가능하므').
+    if term.endswith(("하", "되", "므", "며", "고", "서", "니")):
+        return None
+    return term
+
+
+# 감점 배율. 기존 '배타적 가구상황 태그'와 같은 값에서 출발한다 — 둘 다
+# "원문 근거는 있지만 사용자가 해당자가 아니라고 단정할 수는 없다"는 성격이다.
+# 조정하려면 이 상수만 바꾸면 된다.
+NARROW_DISEASE_FACTOR = 0.7
+
+
+def disease_penalty(
+    row: Dict[str, Any],
+    user_text: str,
+    conditions: Sequence[str],
+    claimed: Set[str],
+) -> Tuple[float, List[str]]:
+    """대화에 한 번도 안 나온 좁은 질환이 자격으로 걸려 있으면 감점한다.
+
+    제외하지 않는다. 사용자가 말하지 않았을 뿐 실제로 그 병일 수 있고,
+    "모르면 배제하지 않는다"는 원칙이 여기에도 그대로 적용된다.
+
+    감점하지 않는 경우:
+      - 질환어가 사용자 발화에 나온다 (그 병을 말한 사람이다)
+      - 이미 확인된 자격과 이어지는 질환이다 (conditions / claimed)
+        예: 장기요양등급을 받았다고 답한 사용자에게 '치매' 게이트 제도를
+            내리면 안 된다. 등급이 곧 그 상태의 확인이다.
+    """
+    terms = narrow_disease_terms(row)
+    if not terms:
+        return 1.0, []
+
+    haystack = user_text or ""
+    unmentioned = [t for t in terms if t not in haystack]
+    if len(unmentioned) < len(terms):
+        # 하나라도 사용자가 말했으면 이 제도는 대화 안에 있는 것이다.
+        return 1.0, []
+
+    # 이미 확인된 자격과 겹치면 손대지 않는다.
+    for group in claimed:
+        _, user_terms = _all_groups().get(group, ((), ()))
+        if any(any(u in t for u in user_terms) for t in terms):
+            return 1.0, []
+    for condition in conditions or ():
+        for keyword in DENIABLE_GROUPS.get(condition, ()):
+            if any(keyword in t for t in terms):
+                return 1.0, []
+
+    return NARROW_DISEASE_FACTOR, ["질환 한정: %s" % ", ".join(unmentioned[:3])]
+
+
 # --- B. 배타적인 가구상황 태그 -------------------------------------------------
 # '저소득'과 '장애인'은 넣지 않는다.
 #   저소득: 대부분 우선지원 성격이라 누구나 해당될 수 있다.
@@ -155,6 +335,7 @@ def penalty_for(
     user_household: Sequence[str],
     claimed: Set[str],
     denied: Sequence[str] = (),
+    conditions: Sequence[str] = (),
 ) -> Tuple[float, List[str], bool]:
     """감점 배율, 이유, 그리고 '목록에서 빼야 하는가'.
 
@@ -191,6 +372,14 @@ def penalty_for(
         factor *= EXCLUSIVE_HOUSEHOLD_FACTOR
         reasons.extend(sorted(narrow))
 
+    # 좁은 질환 게이트. from_source를 켜지 않는다 — 원문 근거가 있어도 이건
+    # 제외가 아니라 감점까지만이다 (사용자가 그 병을 말하지 않았을 뿐일 수 있다).
+    disease_factor, disease_reasons = disease_penalty(
+        row, user_text, conditions, claimed)
+    if disease_factor < 1.0:
+        factor *= disease_factor
+        reasons.extend(disease_reasons)
+
     return factor, reasons, from_source
 
 
@@ -199,11 +388,14 @@ def apply(
     user_text: str,
     user_household: Sequence[str],
     denied: Sequence[str] = (),
+    conditions: Sequence[str] = (),
 ) -> List[Dict[str, Any]]:
     """자격이 어긋나는 제도를 걷어낸 목록을 돌려준다.
 
     원문에 자격이 박힌 건은 빼고, 태그로만 어긋나는 건은 순위만 낮춘다.
     denied는 사용자가 '해당하지 않는다'고 직접 답한 등급·수급 자격이다.
+    conditions는 반대로 '해당한다'고 답한 자격이며, 이미 확인된 상태와
+    이어지는 질환 게이트 제도를 내리지 않기 위해 쓴다.
     """
     claimed = user_claimed_groups(user_text or "")
     if claimed:
@@ -216,7 +408,7 @@ def apply(
     dropped: List[str] = []
     for row in rows:
         factor, reasons, from_source = penalty_for(
-            row, user_text or "", user_household, claimed, denied)
+            row, user_text or "", user_household, claimed, denied, conditions)
         if factor >= 1.0:
             kept.append(row)
             continue

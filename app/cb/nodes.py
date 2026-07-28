@@ -227,7 +227,30 @@ async def extract_intent(state: CbState) -> Dict[str, Any]:
     if caree_age is not None and state.get("caree_age") is None:
         update["caree_age"] = caree_age
 
-    update.update(_grounded_grading(raw, state))
+    grading_update = _grounded_grading(raw, state)
+    update.update(grading_update)
+
+    # 장애 정도가 확정됐다는 것은 장애 등록이 이미 전제됐다는 뜻이다.
+    # '심한/심하지 않은 장애인'이라는 구분 자체가 등록장애인에게만 매겨진다.
+    #
+    # 두 필드가 따로 놀면 위험하다. 실측(2026-07-28)에서 "아버지가 장애인연금
+    # 받고 계시고요"에 severity_hint='심한'은 잡혔는데 conditions는 비어 있어서,
+    # 장애등록을 자격으로 거는 제도를 걸러낼 근거(eligibility.DENIABLE_GROUPS)가
+    # 없는 상태로 검색이 돌았다.
+    #
+    # 근거 없는 hint는 _grounded_grading이 이미 버렸으므로, 여기까지 온 값은
+    # 근거가 있는 것만이다 ('모름'은 severity_from_hint가 None을 돌려줘서 빠진다).
+    if grading.severity_from_hint(grading_update.get("disability_severity_hint")):
+        update["conditions"] = merge_tags(update.get("conditions"), ["장애등록"])
+        # 앞에서 한 번 걸렀지만 여기서 conditions가 늘었으므로 다시 맞춘다.
+        # "장애 등록은 안 했는데 장애인연금 받아요" 같은 모순은 위와 같은 규칙으로
+        # '해당한다'를 믿는다 (아니라고 잘못 읽으면 필요한 제도가 사라진다).
+        update["denied_conditions"] = [
+            v for v in (update.get("denied_conditions") or [])
+            if v not in update["conditions"]
+        ]
+        logger.info("[intent] 장애 정도(%s)가 확정되어 conditions에 장애등록을 함께 넣는다",
+                    grading_update["disability_severity_hint"])
 
     # 나이를 알면 생애주기가 확정된다. 본인과 돌보는 분의 생애주기를 **둘 다** 넣는다.
     #
@@ -650,6 +673,7 @@ def _rerank(rows: List[Dict[str, Any]], state: CbState,
         user_text=" ".join([query_text] + _user_texts(state)),
         user_household=state.get("household") or [],
         denied=state.get("denied_conditions") or [],
+        conditions=state.get("conditions") or [],
     )
     # 확인된 자격 축(장애 정도·소득 구간)으로 올리고 내린다. 목록에서 빼지는
     # 않는다 — 제도 쪽 값의 61%가 카테고리명 사전 매핑에서 온 것이라
