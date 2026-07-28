@@ -634,43 +634,183 @@ Authorization: Bearer {access_token}
 
 ### Response `200 OK`
 
-카드의 모든 필드 + 아래 본문 필드입니다.
+> **상세 응답은 카드(6번)와 필드 구성이 다릅니다.** 카드는 목록용 요약이라
+> `support`/`apply`를 중첩 객체로 묶지만, 상세 화면은 같은 값을 뱃지와 본문
+> 2단으로 쪼개 씁니다. 그래서 상세는 카드를 상속하지 않고 평평한 필드로 나갑니다.
+
+#### 계약의 핵심: 값이 없으면 키도 없습니다
+
+값이 없는 필드는 `null`이 아니라 **키 자체가 빠진 채로** 내려갑니다.
+프론트는 값을 검사하지 말고 **키가 있는지만 보고** 행·섹션을 그리면 됩니다.
+
+```js
+if ("required_forms" in d) { /* 필요 서식 섹션을 그린다 */ }
+```
+
+`null`과 `""`와 `[]`를 모두 "없음"으로 취급하게 만들면 언젠가 한쪽을 빠뜨려
+빈 행이 남습니다. 그래서 "없음"의 표현을 한 가지로 고정했습니다.
+
+**신청 기간·결과 발표일에 해당하는 필드는 스키마에 없습니다.** 원본(복지로)에
+대응하는 데이터가 없어서, `null`을 내려 '언젠가 채워질 자리'처럼 보이게 하지
+않고 아예 뺐습니다. 대신 `detail_link`(공식 사이트)를 화면 최상단에 둡니다.
+
+#### 예시 (실제 데이터: `WLF00006351`)
 
 ```json
 {
-  "serv_id": "WLF00000123",
-  "name": "가족돌봄청년 자기돌봄비 지원",
-  "agency": "서울특별시 은평구",
-  "summary": "가족을 돌보는 청년에게 연 200만 원의 자기돌봄비를 지원합니다.",
-  "region": { "scope": "district", "label": "은평구", "ctpv_nm": "서울특별시", "sgg_nm": "은평구" },
-  "tags": { "life_cycle": ["청년"], "household": ["저소득"], "theme": ["보호·돌봄"] },
-  "support": { "cycle": "년", "provision_type": "현금" },
-  "apply": { "method_name": "온라인 신청", "contact": "02-000-0000" },
-  "link": "https://www.bokjiro.go.kr/...",
-  "match": null,
+  "serv_id": "WLF00006351",
+  "name": "서울특별시 강서구 전세피해임차인 지원사업",
+  "agency": "서울특별시 강서구 도시관리국 부동산정보과",
+  "summary": "전세피해 주택임차인의 피해 회복 지원으로 주거안정 및 주거복지 향상 기여",
+  "region": {
+    "scope": "district", "label": "강서구",
+    "ctpv_nm": "서울특별시", "sgg_nm": "강서구"
+  },
+  "tags": {
+    "life_cycle": ["청년", "중장년", "노년"],
+    "household": ["보훈대상자"],
+    "theme": ["서민금융"]
+  },
+  "detail_link": "https://www.bokjiro.go.kr/ssis-tbu/twataa/wlfareInfo/moveTWAT52011M.do?wlfareInfoId=WLF00006351&wlfareInfoReldBztpCd=02",
 
-  "target_detail": "가족을 돌보는 만 14세 이상 34세 이하 청년 ...",
-  "select_criteria": "기준 중위소득 100% 이하 ...",
-  "service_content": "연 200만 원 범위 내에서 ...",
-  "apply_method": "복지로 또는 주민센터 방문 신청 ...",
-  "criteria_year": 2026,
-  "extra_info": {}
+  "support_cycle": "1회성",
+  "support_cycle_label": "지급 주기",
+  "provision_type_badge": "현금지급",
+  "apply_method_badge": "방문, 인터넷",
+  "apply_method_detail": "(오프라인)서울 강서구청 1층 부동산정보과 방문 신청(온라인) 정부24에서 강서구 전세피해지원금 검색 후 신청",
+
+  "contact_list": [
+    { "name": "서울특별시 강서구청 부동산정보과", "phone": "02-2600-6907" },
+    { "name": "서울특별시 강서구청 부동산정보과", "phone": "02-2600-6891" }
+  ],
+
+  "required_forms": [
+    { "name": "서울특별시 강서구 전세피해 및 전세사기피해자 지원 조례.hwp",
+      "url": "https://www.bokjiro.go.kr/ssis-tbu/CmmFileUtil/siteQnaInfoDownload.do?atcflId=20260610UUWBM1116360196245114&atcflSn=1" },
+    { "name": "전세사기 피해지원 신청서.hwp",
+      "url": "https://www.bokjiro.go.kr/ssis-tbu/CmmFileUtil/siteQnaInfoDownload.do?atcflId=20260610UUWBM1135420196252686&atcflSn=1" },
+    { "name": "개인정보 수집·이용 등 동의서.hwp",
+      "url": "https://www.bokjiro.go.kr/ssis-tbu/CmmFileUtil/siteQnaInfoDownload.do?atcflId=20260610UUWBM1136470196253806&atcflSn=1" },
+    { "name": "전세사기 피해지원 신청 위임장.hwp",
+      "url": "https://www.bokjiro.go.kr/ssis-tbu/CmmFileUtil/siteQnaInfoDownload.do?atcflId=20260610UUWBM1138070196253961&atcflSn=1" }
+  ],
+
+  "target_detail": "아래 요건 모두 충족하는 경우 지원 가능 (공통) 1. 서울시 강서구의 주택을 임차한 사람 ...",
+  "select_criteria": "(선정기준 상세내용)  아래 요건 모두 충족하는 경우 지원 가능 ...",
+  "service_content": "전세피해자 지원금(택1, 중복불가, 소급적용, 소득기준 적용 없음) ① 전세보증금 반환보증 보증료 지원: 100만원 이내(실비)/1회 ...",
+
+  "extra_info": {
+    "baslaw": [
+      { "code": "030", "name": "서울특별시 강서구 전세피해 및 전세사기피해자 지원 조례 제7조" }
+    ]
+  }
 }
 ```
 
+이 응답에는 `contact`, `criteria_year`가 없습니다. 문의처가 2곳이라
+`contact` 대신 `contact_list`가 나갔고, 기준연도는 이 제도에 없습니다.
+
+#### 필드
+
+**정체 / 머리말**
+
 | 필드 | 타입 | 설명 |
 | --- | --- | --- |
-| `target_detail` | String \| null | 지원대상 원문 |
-| `select_criteria` | String \| null | 선정기준 원문 |
-| `service_content` | String \| null | 지원내용 원문 |
-| `apply_method` | String \| null | 신청방법 원문 |
-| `criteria_year` | Integer \| null | 기준연도 |
-| `extra_info` | Object | 출처별 부가 정보. 비어 있을 수 있습니다 |
-| `match` | null | 상세 조회는 검색 결과가 아니므로 항상 `null` |
+| `serv_id` | String | 항상 있습니다 |
+| `name` | String | 항상 있습니다 |
+| `agency` | String? | 담당 부처·부서 |
+| `summary` | String? | 한 줄 요약 |
+| `region` | Object | 카드와 같은 형태. `ctpv_nm`/`sgg_nm`은 없으면 키가 빠집니다 |
+| `tags` | Object? | 3축이 **모두** 비면 통째로 빠집니다. 나갈 때는 세 축이 늘 함께 나갑니다(개별 축은 `[]`일 수 있음) |
+| `detail_link` | String? | 복지로 원문 링크. **화면 최상단에 유지합니다.** 카드의 `link`와 같은 값이지만 이름이 다릅니다 |
 
-- 값이 없는 본문 필드는 빈 문자열이 아니라 `null`로 내려갑니다. **프론트는 해당 섹션을 통째로 숨기면 됩니다.**
-- 원문은 공공데이터 그대로라 문단 구분이 거칠 수 있습니다. 쉬운 말 설명(8번)이 이 문제를 보완합니다.
-- 운영이 종료된 제도도 404가 아니라 정상 응답합니다. 저장해 둔 사용자가 열었을 때 빈 화면을 보는 것보다 낫기 때문입니다.
+**요약 행 / 뱃지**
+
+| 필드 | 타입 | 설명 |
+| --- | --- | --- |
+| `support_cycle` | String? | **지급 주기**입니다. 신청 기간이 아닙니다 |
+| `support_cycle_label` | String? | 항상 `"지급 주기"`. `support_cycle`이 있을 때만 함께 나갑니다 |
+| `provision_type_badge` | String? | 지원 내용 앞에 붙일 뱃지 |
+| `apply_method_badge` | String? | 짧은 신청 수단 라벨(예: `"방문"`). **없으면 뱃지를 그리지 마세요** |
+| `apply_method_detail` | String? | 신청 절차 전문. 본문으로 그립니다 |
+
+- `support_cycle` 실측 값(856건): `월`(249) `1회성`(215) `수시`(194) `년`(126)
+  `반기`(35) `분기`(26) `주`(9) `기타`(1) `부정기`(1). **9종이며 열거형으로
+  하드코딩하지 마세요.**
+- `apply_method_badge`는 **856건 중 551건(64%)이 없습니다.** 지자체 제도에만
+  주로 붙습니다. 뱃지가 없는 화면이 기본값이라고 보고 레이아웃을 잡으세요.
+- `apply_method_badge`와 `provision_type_badge`는 **쉼표로 이어 붙은 복수 값이
+  올 수 있습니다** (`"방문, 인터넷"`, `"현금지급, 현물지급"`). 원본이 그렇게
+  들어옵니다. `provision_type_badge`는 실측 50종이고 최장
+  `"프로그램/서비스(서비스), 자원봉사, 현물지급, 현금대여(융자), 현금지급"`입니다.
+  뱃지 칩은 넘칠 때 줄이거나 잘라 주세요.
+
+**문의처 — 둘 중 하나만 나갑니다**
+
+| 필드 | 타입 | 설명 |
+| --- | --- | --- |
+| `contact` | String? | 대표 연락처 하나 |
+| `contact_list` | Array? | `{name?, phone}` 목록. 연락처가 **2곳 이상**일 때 `contact` 대신 나갑니다 |
+
+- `contact`와 `contact_list`는 **동시에 나오지 않습니다.** `contact_list`가
+  있으면 목록으로, 없으면 `contact` 한 줄로 그리면 됩니다.
+- 856건 중 `contact_list`가 나가는 건은 153건(18%)입니다. 나머지는 `contact`입니다.
+- **목록이 길 수 있습니다.** 최대 26개(자치구별 창구를 모두 싣는 광역 제도)이고
+  16개 이상인 제도가 11건입니다. 접었다 펴는 UI를 권합니다.
+- `name`이 같고 번호만 다른 항목이 있습니다(같은 부서의 회선 2개). 이름으로
+  묶지 말고 `phone` 기준으로 한 줄씩 그리세요. `name`이 없는 항목도 있습니다.
+
+**필요 서식**
+
+| 필드 | 타입 | 설명 |
+| --- | --- | --- |
+| `required_forms` | Array? | `{name, url?}` 목록. 비어 있으면 **키가 없습니다** — 섹션을 숨기세요 |
+
+- 856건 중 651건(76%)에 서식이 있습니다.
+- `url`은 복지로 파일 다운로드 링크입니다. 드물게 `url`이 없는 항목이 있고,
+  그때는 이름만 표시하고 링크를 걸지 않으면 됩니다.
+- 파일명은 원본 그대로입니다. 관리자가 잘못 올린 이름(`"오류.hwpx"` 등)이
+  섞여 있으니 화면에서 자르되 가공하지는 않습니다.
+
+**자격 / 내용 상세 (아코디언 3단)**
+
+| 필드 | 타입 | 설명 |
+| --- | --- | --- |
+| `target_detail` | String? | "지원 대상" 섹션 |
+| `select_criteria` | String? | "선정 기준" 섹션 |
+| `service_content` | String? | "지원 내용" 섹션 |
+
+**이 세 필드는 가공하지 않은 원문입니다.** 검색·랭킹이 읽는 텍스트와 한 글자도
+다르지 않습니다. 사용자가 "왜 이 제도가 나왔는지"를 확인하는 자리이므로
+서버가 요약하거나 다듬지 않습니다. 문단 구분이 거친 것도 원본 그대로입니다 —
+읽기 힘든 경우는 쉬운 말 설명(8번)이 보완합니다.
+
+**나머지**
+
+| 필드 | 타입 | 설명 |
+| --- | --- | --- |
+| `criteria_year` | Integer? | 기준연도 |
+| `extra_info` | Object? | 위에서 못 뽑은 부가 정보(`baslaw` 근거법령, `inqpl_hmpg` 관련 사이트). 비어 있으면 키가 빠집니다 |
+
+- `extra_info`에서 `inqpl_ctadr`와 `basfrm`은 **빠져 있습니다.** 각각
+  `contact_list`와 `required_forms`로 이미 나갔기 때문입니다. 같은 값을 두
+  군데로 내려서 프론트가 어느 쪽을 그릴지 정하게 만들지 않습니다.
+- 운영이 종료된 제도도 404가 아니라 정상 응답합니다. 저장해 둔 사용자가 열었을 때
+  빈 화면을 보는 것보다 낫기 때문입니다.
+
+#### 카드(6번)에서 이름이 바뀐 필드
+
+상세 응답에만 해당합니다. 결과 목록의 카드 필드는 그대로입니다.
+
+| 카드 | 상세 |
+| --- | --- |
+| `link` | `detail_link` |
+| `support.cycle` | `support_cycle` |
+| `support.provision_type` | `provision_type_badge` |
+| `apply.method_name` | `apply_method_badge` |
+| `apply.contact` | `contact` 또는 `contact_list` |
+| `apply_method` | `apply_method_detail` |
+| `match` | (없음 — 상세는 검색 결과가 아니라 항상 `null`이었습니다) |
 
 ### 주요 오류
 
@@ -681,47 +821,100 @@ Authorization: Bearer {access_token}
 
 ---
 
-## 8. 쉬운 말 설명 (제도번역기)
+## 8. 말풍선 A — 개인화된 쉬운 말 설명
 
 기존 `POST /api/v1/policies/{policy_id}/translate`를 대체합니다.
+
+> **캐시하지 마세요.** 이 응답은 제도 원문뿐 아니라 **현재 대화의 State**를 함께
+> 읽습니다. 사용자마다 다르고, 같은 사용자도 대화가 진행되면 달라집니다.
+> 말풍선 B(`apply_guide_easy`)나 필요서류는 제도 원문만 보고 미리 만들어 둔
+> 값이라 상세 API에 실려 오지만, 이건 매번 새로 만듭니다.
+>
+> **이 호출만 따로 비동기로 띄우세요.** 왼쪽 정보 영역이나 말풍선 B의 렌더링을
+> 여기에 묶으면, LLM 응답(2~4초)만큼 화면 전체가 늦어집니다.
 
 ### Request
 
 ```http
 POST /api/v1/cb/institutions/{serv_id}/translate
 Authorization: Bearer {access_token}
+Content-Type: application/json
 ```
 
-Request Body는 없습니다.
+```json
+{ "thread_id": "cb-a1b2c3d4e5f6" }
+```
+
+| 필드 | 타입 | 필수 | 설명 |
+| --- | --- | --- | --- |
+| `thread_id` | String | 아니오 | 개인화에 쓸 대화. 생략하면 3번 섹션 없이 1·2번만 내려갑니다 |
+
+Body 자체를 생략해도 됩니다(기존 클라이언트 호환). 남의 `thread_id`를 넣으면 `403`입니다.
 
 ### Response `200 OK`
 
 ```json
 {
-  "serv_id": "WLF00000123",
-  "name": "가족돌봄청년 자기돌봄비 지원",
-  "easy_text": "가족을 돌보느라 자기 시간을 못 쓰는 청년에게 1년에 200만 원을 줍니다. ..."
+  "serv_id": "WLF00003181",
+  "name": "장애인의료비지원",
+  "sections": {
+    "summary_easy": "장애인의료비지원은 등록된 장애가 있는 분이 병원에 가거나 약을 살 때 본인이 직접 내야 하는 돈을 대신 내주는 제도예요. 다만 건강보험이 적용되는 진료에 한해서만 지원돼요.",
+    "target_general": "이 제도는 원래 의료급여 2종 수급자이거나, 기초생활수급자 중 근로 능력이 있는 세대에 속한 등록장애인, 또는 건강보험 차상위 본인부담 경감대상자인 등록장애인을 위해 만들어졌어요. 만성질환이 있거나 18세 미만인 장애아동도 대상이 될 수 있어요.",
+    "personal_fit": "돌보시는 분이 장애 등록이 되어 계신 걸로 확인됐으니, 이 제도의 기본 조건 중 하나에는 해당될 수 있어요. 다만 의료급여 2종이나 차상위 본인부담 경감대상 같은 세부 조건까지 맞는지는 아직 확인되지 않아서, 조금 더 알아보시는 게 좋아요."
+  },
+  "personalized": true,
+  "grounded_on": [
+    "지금 돌보는 분을 위한 지원을 찾고 있음",
+    "본인 나이: 만 24세",
+    "돌보는 분 연세: 만 80세",
+    "돌보는 분 장애등록에 해당한다고 확인됨"
+  ],
+  "easy_text": "…세 섹션을 이어붙인 텍스트…"
 }
 ```
 
-| 필드 | 타입 | 기존 명세 대응 | 설명 |
-| --- | --- | --- | --- |
-| `serv_id` | String | `policy_id` | 요청한 제도 |
-| `name` | String | (없었음) | 제도명. 말풍선 머리말에 쓰기 좋습니다 |
-| `easy_text` | String | `explanation` | 쉬운 말 설명 |
+| 필드 | 타입 | 설명 |
+| --- | --- | --- |
+| `sections.summary_easy` | String \| null | **① 쉬운 설명** — 이 제도가 뭘 해주는지 |
+| `sections.target_general` | String \| null | **② 원래 어떤 계층을 위한 제도인지** — 개인화 아님. 제도 자체 설명 |
+| `sections.personal_fit` | String \| null | **③ 왜 지금 특히 해당될 수 있는지** — 근거가 없으면 `null` |
+| `personalized` | Boolean | ③이 실제로 채워졌는가 |
+| `grounded_on` | String[] | ③이 근거로 삼은 '이번 대화에서 확인된 사실' |
+| `easy_text` | String | 세 섹션을 이어붙인 텍스트. **하위호환용**이며 새 화면은 `sections`를 쓰세요 |
+
+**세 섹션은 순서가 고정입니다.** ①→②→③ 순으로 그리세요.
+
+### `personal_fit`이 `null`인 경우
+
+세 가지입니다. 셋 다 정상이고, 프론트는 **③ 영역을 통째로 숨기면** 됩니다.
+
+1. `thread_id`를 안 보냈다
+2. 보냈지만 그 대화에서 확인된 사실이 아직 하나도 없다 (`grounded_on`이 빈 배열)
+3. 확인된 사실은 있는데 이 제도의 조건과 이어지지 않는다 — 예를 들어 80세 어르신을 돌보는 상황에서 아이돌봄서비스를 열었을 때. 억지로 잇지 않고 비웁니다
+
+### 이 말풍선이 하지 않는 것
+
+- **신청 방법·기관·연락처·제출 서류를 말하지 않습니다.** 그건 말풍선 B(`apply_guide_easy`)와 `required_documents_ai`의 역할이라, 겹치면 같은 말이 두 번 나옵니다.
+- **자격을 단정하지 않습니다.** "받으실 수 있어요"가 아니라 "해당될 수 있어요"로 나갑니다. 실제 심사 기준은 서버가 알 수 없습니다.
+- **확인되지 않은 정보를 언급하지 않습니다.** 대화에서 소득을 확인하지 못했으면 소득 이야기는 아예 나오지 않습니다("소득은 모르지만…" 같은 말도 하지 않습니다). `grounded_on`에 있는 항목만 ③의 근거입니다.
 
 ### 화면 처리
 
-1. **사용자가 눌렀을 때만** 호출합니다. 목록에서 미리 불러두지 마세요. LLM 호출이라 2~4초 걸립니다.
+1. **사용자가 눌렀을 때만** 호출합니다. 목록에서 미리 불러두지 마세요.
 2. 호출 시작과 함께 `제도를 쉬운 말로 풀어보고 있어요.`를 먼저 표시합니다.
-3. 성공하면 그 문구를 `easy_text`로 교체합니다.
+3. 성공하면 `sections`로 교체합니다. `personal_fit`이 `null`이면 ③은 그리지 않습니다.
 4. 상세 화면이 바뀐 뒤 도착한 응답은 `ignore` 플래그로 무시합니다.
 
 **생성에 실패해도 500이 아닙니다.** 원문은 이미 상세 API로 볼 수 있기 때문에,
-`easy_text`에 아래 문구가 담긴 `200`이 내려갑니다.
+세 섹션이 모두 `null`이고 `easy_text`에 아래 문구가 담긴 `200`이 내려갑니다.
 
 ```json
-{ "serv_id": "...", "name": "...", "easy_text": "쉬운 말 설명을 준비하지 못했어요. 잠시 후 다시 시도해주세요." }
+{
+  "serv_id": "...", "name": "...",
+  "sections": { "summary_easy": null, "target_general": null, "personal_fit": null },
+  "personalized": false, "grounded_on": [],
+  "easy_text": "쉬운 말 설명을 준비하지 못했어요. 잠시 후 다시 시도해주세요."
+}
 ```
 
 ### 주요 오류
@@ -729,6 +922,8 @@ Request Body는 없습니다.
 | Status | `error` | 조건 |
 | --- | --- | --- |
 | `404` | `INSTITUTION_NOT_FOUND` | 없는 `serv_id` |
+| `404` | `THREAD_NOT_FOUND` | 없는 `thread_id` |
+| `403` | `FORBIDDEN` | 남의 `thread_id` |
 | `401` | `UNAUTHORIZED` | 토큰 없음/만료 |
 
 ---

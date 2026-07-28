@@ -133,16 +133,31 @@ def print_detail(client, session: Session, index: int) -> None:
     print("\n" + c("═" * 64, DIM))
     print(c(d["name"], BOLD), c("[%s]" % d["region"]["label"], DIM))
     print(c("═" * 64, DIM))
+    # 상세 응답은 값이 없는 필드를 키째로 빼고 내려준다. 전부 .get으로 읽는다.
     for label, key in (("요약", "summary"), ("지원대상", "target_detail"),
                        ("선정기준", "select_criteria"), ("서비스내용", "service_content"),
-                       ("신청방법", "apply_method")):
+                       ("신청방법", "apply_method_detail")):
         value = d.get(key)
         if value:
             print(c("[%s]" % label, CYAN), value[:600])
-    print(c("[담당기관]", CYAN), d["agency"] or "-",
-          c("[문의처]", CYAN), d["apply"]["contact"] or "-")
-    if d["link"]:
-        print(c("[링크]", CYAN), d["link"])
+
+    badges = [d[k] for k in ("apply_method_badge", "provision_type_badge") if d.get(k)]
+    if d.get("support_cycle"):
+        badges.append("%s %s" % (d.get("support_cycle_label") or "지급 주기", d["support_cycle"]))
+    if badges:
+        print(c("[뱃지]", CYAN), " · ".join(badges))
+
+    contacts = d.get("contact_list")
+    contact_text = (
+        " / ".join("%s %s" % (x.get("name") or "문의처", x["phone"]) for x in contacts)
+        if contacts else (d.get("contact") or "-")
+    )
+    print(c("[담당기관]", CYAN), d.get("agency") or "-", c("[문의처]", CYAN), contact_text)
+
+    for form in d.get("required_forms") or []:
+        print(c("[서식]", CYAN), form["name"], c(form.get("url") or "", DIM))
+    if d.get("detail_link"):
+        print(c("[링크]", CYAN), d["detail_link"])
     print(c("═" * 64, DIM) + "\n")
 
 

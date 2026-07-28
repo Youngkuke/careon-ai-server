@@ -7,6 +7,7 @@
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.cb import constants
+from app.cb.schemas import SUPPORT_CYCLE_LABEL
 
 # 검색에서 가져올 건수. 대화 중에는 검색을 아예 하지 않으므로 이 한 번의
 # 검색에서 두 구간을 모두 채운다.
@@ -105,6 +106,128 @@ def to_card(row: Dict[str, Any], rank: Optional[int] = None) -> Dict[str, Any]:
             "matched_by": matched_by(row),
         }
     return card
+
+
+def to_detail(row: Dict[str, Any]) -> Dict[str, Any]:
+    """DB 행 → 상세 화면 dict.
+
+    카드와 달리 본문을 싣고, support/apply 중첩을 풀어 화면 역할대로 편다.
+    비어 있는 값은 None으로 남겨둔다 — 응답에서 키를 빼는 일은 라우터의
+    response_model_exclude_none이 한 번에 처리한다.
+    """
+    scope = row.get("region_scope") or constants.REGION_NATIONAL
+    extra_info = dict(row.get("extra_info") or {})
+
+    # 3축은 늘 함께 나간다(Filters는 결과·턴 응답과 공유하는 고정 형태다).
+    # 다만 세 축이 모두 비면 tags를 통째로 뺀다.
+    tags = {
+        "life_cycle": list(row.get("life_cycle_tags") or []),
+        "household": list(row.get("household_tags") or []),
+        "theme": list(row.get("theme_tags") or []),
+    }
+
+    support_cycle = _text(row.get("support_cycle"))
+    contacts = _contact_entries(extra_info)
+    # 연락처가 2곳 이상일 때만 목록으로 바꾼다. 1곳이면 contact 컬럼이 이미
+    # 그 값이라(normalize.py 참고) 목록으로 감쌀 이유가 없다.
+    multiple = len(contacts) >= 2
+
+    return {
+        "serv_id": row["serv_id"],
+        "name": row.get("serv_nm") or "",
+        "agency": _text(row.get("jur_org_nm")),
+        "summary": _text(row.get("serv_dgst")),
+        "region": {
+            "scope": scope,
+            "label": region_label(scope, row.get("ctpv_nm"), row.get("sgg_nm")),
+            "ctpv_nm": row.get("ctpv_nm"),
+            "sgg_nm": row.get("sgg_nm"),
+        },
+        # 빈 배열 3개를 내려주면 프론트가 칩 줄을 그릴지를 값 검사로 다시
+        # 판단해야 한다. 하나라도 있을 때만 내보낸다.
+        "tags": tags if any(tags.values()) else None,
+        "detail_link": _text(row.get("detail_link")),
+
+        "support_cycle": support_cycle,
+        "support_cycle_label": SUPPORT_CYCLE_LABEL if support_cycle else None,
+        "provision_type_badge": _text(row.get("provision_type")),
+        "apply_method_badge": _text(row.get("apply_method_nm")),
+        "apply_method_detail": _text(row.get("apply_method")),
+
+        "contact": None if multiple else _text(row.get("contact")),
+        "contact_list": contacts if multiple else None,
+        "required_forms": _required_forms(extra_info) or None,
+
+        "target_detail": _text(row.get("target_detail")),
+        "select_criteria": _text(row.get("select_criteria")),
+        "service_content": _text(row.get("service_content")),
+        "criteria_year": row.get("criteria_year"),
+        # 위에서 뽑아 쓴 두 키는 뺀다. 같은 값이 두 군데로 나가면 프론트가
+        # 어느 쪽을 그릴지 정해야 하고, 그 판단은 여기서 이미 끝냈다.
+        "extra_info": _remaining_extra_info(extra_info) or None,
+    }
+
+
+# to_detail이 전용 필드로 승격시켜 내보내는 extra_info 키.
+_EXTRACTED_EXTRA_KEYS = {"inqpl_ctadr", "basfrm"}
+
+
+def _text(value: Optional[str]) -> Optional[str]:
+    text = (value or "").strip()
+    return text or None
+
+
+def _remaining_extra_info(extra_info: Dict[str, Any]) -> Dict[str, Any]:
+    """전용 필드로 승격시키고 남은 부가 정보 (근거법령·관련 사이트 등).
+
+    extra_info는 Dict로 그대로 나가기 때문에 라우터의 exclude_none이 안까지
+    닿지 않는다. 여기서 null 키를 직접 걷어내야 '값이 없으면 키도 없다'는
+    응답 전체의 약속이 이 블록에서만 깨지지 않는다.
+    """
+    out: Dict[str, Any] = {}
+    for key, entries in extra_info.items():
+        if key in _EXTRACTED_EXTRA_KEYS or not isinstance(entries, list):
+            continue
+        cleaned = [
+            {k: v for k, v in entry.items() if v is not None}
+            for entry in entries
+            if isinstance(entry, dict) and any(v is not None for v in entry.values())
+        ]
+        if cleaned:
+            out[key] = cleaned
+    return out
+
+
+def _contact_entries(extra_info: Dict[str, Any]) -> List[Dict[str, Optional[str]]]:
+    """extra_info.inqpl_ctadr → [{name, phone}].
+
+    번호(value)가 없는 항목은 버린다. 기관명만 있으면 사용자가 연락할 수 없고,
+    문의처 목록에 이름만 한 줄 뜨는 것은 정보가 아니라 잡음이다.
+    """
+    out: List[Dict[str, Optional[str]]] = []
+    for item in extra_info.get("inqpl_ctadr") or []:
+        if not isinstance(item, dict):
+            continue
+        phone = _text(item.get("value"))
+        if phone:
+            out.append({"name": _text(item.get("name")), "phone": phone})
+    return out
+
+
+def _required_forms(extra_info: Dict[str, Any]) -> List[Dict[str, Optional[str]]]:
+    """extra_info.basfrm → [{name, url}].
+
+    이름이 비고 링크만 있는 항목은 링크를 이름 자리에 그대로 쓴다. 행을 버리면
+    '받아야 할 서식이 있다'는 사실 자체가 화면에서 사라지기 때문이다.
+    """
+    out: List[Dict[str, Optional[str]]] = []
+    for item in extra_info.get("basfrm") or []:
+        if not isinstance(item, dict):
+            continue
+        name, url = _text(item.get("name")), _text(item.get("value"))
+        if name or url:
+            out.append({"name": name or url, "url": url})
+    return out
 
 
 def split_sections(rows: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:

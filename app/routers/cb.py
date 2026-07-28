@@ -24,6 +24,7 @@ from app.cb import profile as cb_profile
 from app.cb import threads
 from app.cb.schemas import (
     BannerSection,
+    ExplainSections,
     Filters,
     InstitutionCard,
     InstitutionDetail,
@@ -37,6 +38,7 @@ from app.cb.schemas import (
     ResultsResponse,
     ResultSummary,
     ThreadStartResponse,
+    TranslateRequest,
     TranslateResponse,
     TurnRequest,
     TurnResponse,
@@ -192,54 +194,72 @@ def _section(title: str, raw_cards: Optional[List[Dict[str, Any]]]) -> ResultSec
 
 
 @router.get("/institutions/{serv_id}", response_model=InstitutionDetail,
+            response_model_exclude_none=True,
             dependencies=[Depends(require_cb)])
 async def get_institution(
     serv_id: str,
     carer_id: int = Depends(get_current_carer_id),
 ) -> InstitutionDetail:
-    """제도 상세. 카드에서 뺀 긴 본문은 여기서만 내려간다."""
+    """제도 상세. 카드에서 뺀 긴 본문은 여기서만 내려간다.
+
+    값이 없는 필드는 null이 아니라 키 자체가 빠진 채로 나간다
+    (response_model_exclude_none). 프론트는 값을 검사하지 않고 키가 있는지만
+    보고 행·섹션을 그리면 된다. null과 '없음'을 둘 다 다루게 하면 결국 한쪽을
+    빠뜨려서 빈 행이 남는다.
+    """
     row = await cb_db.fetch_institution(serv_id)
     if row is None:
         raise InstitutionNotFound()
 
-    return InstitutionDetail(
-        **cards.to_card(row),
-        target_detail=_text(row.get("target_detail")),
-        select_criteria=_text(row.get("select_criteria")),
-        service_content=_text(row.get("service_content")),
-        apply_method=_text(row.get("apply_method")),
-        criteria_year=row.get("criteria_year"),
-        extra_info=row.get("extra_info") or {},
-    )
-
-
-def _text(value: Optional[str]) -> Optional[str]:
-    """빈 문자열은 null로 내려서 프론트가 섹션을 통째로 숨길 수 있게 한다."""
-    text = (value or "").strip()
-    return text or None
+    return InstitutionDetail(**cards.to_detail(row))
 
 
 @router.post("/institutions/{serv_id}/translate", response_model=TranslateResponse,
              dependencies=[Depends(require_cb)])
 async def translate_institution(
     serv_id: str,
+    body: Optional[TranslateRequest] = None,
     carer_id: int = Depends(get_current_carer_id),
 ) -> TranslateResponse:
-    """제도 원문을 쉬운 말로 풀어준다.
+    """말풍선 A — 제도를 쉬운 말로 풀고, 이 사람에게 왜 해당될 수 있는지 덧붙인다.
 
-    LLM 호출이 있어서 2~4초 걸린다. 상세 화면에서 사용자가 눌렀을 때만
-    부르고, 목록에서 미리 불러두지 않는다.
+    LLM 호출이 있어서 2~4초 걸린다. **캐시할 수 없다** — 대화 State를 함께
+    읽으므로 사용자마다, 그리고 대화가 진행되면 같은 사용자도 결과가 달라진다.
+    (말풍선 B의 apply_guide_easy나 필요서류는 제도 원문만 보므로 배치로 미리
+    만들어 두지만, 이건 그럴 수 없다.)
+
+    그래서 프론트는 이 호출을 **따로 비동기로** 띄우고, 왼쪽 정보 영역이나
+    말풍선 B의 렌더링을 여기에 묶지 않아야 한다.
+
+    thread_id는 선택이다. 주면 그 대화에서 확인된 사실로 3번 섹션을 채우고,
+    없으면 1·2번만 만든다. 남의 스레드는 열 수 없다(require_owned).
     """
     row = await cb_db.fetch_institution(serv_id)
     if row is None:
         raise InstitutionNotFound()
 
-    text = await explain.easy_text(row)
-    if not text:
-        # 생성 실패를 500으로 올리지 않는다. 원문은 상세 API로 이미 볼 수 있다.
-        text = "쉬운 말 설명을 준비하지 못했어요. 잠시 후 다시 시도해주세요."
+    state: Optional[Dict[str, Any]] = None
+    if body is not None and body.thread_id:
+        state = await threads.require_owned(body.thread_id, carer_id)
 
-    return TranslateResponse(serv_id=serv_id, name=row.get("serv_nm") or "", easy_text=text)
+    sections, facts = await explain.personal_explain(row, state)
+
+    joined = "\n\n".join(
+        s for s in (sections["summary_easy"], sections["target_general"],
+                    sections["personal_fit"]) if s
+    )
+    if not joined:
+        # 생성 실패를 500으로 올리지 않는다. 원문은 상세 API로 이미 볼 수 있다.
+        joined = "쉬운 말 설명을 준비하지 못했어요. 잠시 후 다시 시도해주세요."
+
+    return TranslateResponse(
+        serv_id=serv_id,
+        name=row.get("serv_nm") or "",
+        sections=ExplainSections(**sections),
+        personalized=bool(sections["personal_fit"]),
+        grounded_on=facts,
+        easy_text=joined,
+    )
 
 
 @router.delete("/threads/{thread_id}", response_model=MessageOnly,
