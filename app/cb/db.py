@@ -147,16 +147,19 @@ async def fetch_institution(serv_id: str) -> Optional[Dict[str, Any]]:
             # 배치가 채운 값이지만 상세 조회는 '읽어서 그대로 내보내는' 경로다.
             # 실시간 답변(nodes/explain/prompts)이 읽지 않는다는 004의 원칙과는
             # 무관하다 — 그쪽은 LLM이 근거로 삼는 것을 막는 규칙이다.
-            "       apply_guide_easy "
+            "       apply_guide_easy, apply_period_start, apply_deadline, "
+            "       result_announcement_date, required_documents_ai "
             "FROM cb.cb_institutions WHERE serv_id = $1",
             serv_id,
         )
     if row is None:
         return None
     out = dict(row)
-    # extra_info는 JSONB다. asyncpg는 문자열로 돌려준다.
+    # JSONB는 asyncpg가 문자열로 돌려준다.
     if isinstance(out.get("extra_info"), str):
         out["extra_info"] = json.loads(out["extra_info"] or "{}")
+    if isinstance(out.get("required_documents_ai"), str):
+        out["required_documents_ai"] = json.loads(out["required_documents_ai"] or "[]")
     return out
 
 

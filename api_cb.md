@@ -676,8 +676,8 @@ if ("required_forms" in d) { /* 필요 서식 섹션을 그린다 */ }
   "support_cycle": "1회성",
   "support_cycle_label": "지급 주기",
   "provision_type_badge": "현금지급",
-  "apply_method_badge": "방문, 인터넷",
-  "apply_method_detail": "(오프라인)서울 강서구청 1층 부동산정보과 방문 신청(온라인) 정부24에서 강서구 전세피해지원금 검색 후 신청",
+  "apply_method_nm": "방문, 인터넷",
+  "apply_method": "(오프라인)서울 강서구청 1층 부동산정보과 방문 신청(온라인) 정부24에서 강서구 전세피해지원금 검색 후 신청",
 
   "contact_list": [
     { "name": "서울특별시 강서구청 부동산정보과", "phone": "02-2600-6907" },
@@ -731,13 +731,13 @@ if ("required_forms" in d) { /* 필요 서식 섹션을 그린다 */ }
 | `support_cycle` | String? | **지급 주기**입니다. 신청 기간이 아닙니다 |
 | `support_cycle_label` | String? | 항상 `"지급 주기"`. `support_cycle`이 있을 때만 함께 나갑니다 |
 | `provision_type_badge` | String? | 지원 내용 앞에 붙일 뱃지 |
-| `apply_method_badge` | String? | 짧은 신청 수단 라벨(예: `"방문"`). **없으면 뱃지를 그리지 마세요** |
-| `apply_method_detail` | String? | 신청 절차 **원문**. 공공데이터 그대로입니다 |
+| `apply_method_nm` | String? | 짧은 신청 수단 라벨(예: `"방문"`). **없으면 뱃지를 그리지 마세요** |
+| `apply_method` | String? | 신청 절차 **원문**. 공공데이터 그대로입니다 |
 | `apply_guide_easy` | String? | 신청 절차를 **쉬운 말로 푼 가이드**. 아래 참고 |
 
 #### `apply_guide_easy` — 쉬운 신청 가이드
 
-`apply_method_detail`(원문)을 대체하지 않고 나란히 나갑니다. 둘 다 그릴지,
+`apply_method`(원문)을 대체하지 않고 나란히 나갑니다. 둘 다 그릴지,
 쉬운 가이드만 그릴지는 화면에서 정하세요.
 
 DB에 저장된 값을 **가공 없이 그대로** 내려줍니다. 서버는 앞뒤 공백만 정리합니다.
@@ -769,11 +769,11 @@ DB에 저장된 값을 **가공 없이 그대로** 내려줍니다. 서버는 �
 - `support_cycle` 실측 값(856건): `월`(249) `1회성`(215) `수시`(194) `년`(126)
   `반기`(35) `분기`(26) `주`(9) `기타`(1) `부정기`(1). **9종이며 열거형으로
   하드코딩하지 마세요.**
-- `apply_method_badge`는 **856건 중 551건(64%)이 없습니다.** 지자체 제도에만
-  주로 붙습니다. 뱃지가 없는 화면이 기본값이라고 보고 레이아웃을 잡으세요.
-- `apply_method_badge`와 `provision_type_badge`는 **쉼표로 이어 붙은 복수 값이
+- `apply_method_nm`는 **856건 중 127건(15%)이 없습니다.** 뱃지가 없는 경우도
+  자연스럽게 보이도록 레이아웃을 잡으세요.
+- `apply_method_nm`와 `provision_type_badge`는 **쉼표로 이어 붙은 복수 값이
   올 수 있습니다** (`"방문, 인터넷"`, `"현금지급, 현물지급"`). 원본이 그렇게
-  들어옵니다. `provision_type_badge`는 실측 50종이고 최장
+  들어옵니다. `provision_type_badge`는 실측 42종이고 최장
   `"프로그램/서비스(서비스), 자원봉사, 현물지급, 현금대여(융자), 현금지급"`입니다.
   뱃지 칩은 넘칠 때 줄이거나 잘라 주세요.
 
@@ -839,9 +839,9 @@ DB에 저장된 값을 **가공 없이 그대로** 내려줍니다. 서버는 �
 | `link` | `detail_link` |
 | `support.cycle` | `support_cycle` |
 | `support.provision_type` | `provision_type_badge` |
-| `apply.method_name` | `apply_method_badge` |
+| `apply.method_name` | `apply_method_nm` |
 | `apply.contact` | `contact` 또는 `contact_list` |
-| `apply_method` | `apply_method_detail` |
+| `apply_method` | `apply_method` |
 | `match` | (없음 — 상세는 검색 결과가 아니라 항상 `null`이었습니다) |
 
 ### 주요 오류

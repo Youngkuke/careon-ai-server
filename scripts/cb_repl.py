@@ -136,12 +136,12 @@ def print_detail(client, session: Session, index: int) -> None:
     # 상세 응답은 값이 없는 필드를 키째로 빼고 내려준다. 전부 .get으로 읽는다.
     for label, key in (("요약", "summary"), ("지원대상", "target_detail"),
                        ("선정기준", "select_criteria"), ("서비스내용", "service_content"),
-                       ("신청방법", "apply_method_detail")):
+                       ("신청방법", "apply_method")):
         value = d.get(key)
         if value:
             print(c("[%s]" % label, CYAN), value[:600])
 
-    badges = [d[k] for k in ("apply_method_badge", "provision_type_badge") if d.get(k)]
+    badges = [d[k] for k in ("apply_method_nm", "provision_type_badge") if d.get(k)]
     if d.get("support_cycle"):
         badges.append("%s %s" % (d.get("support_cycle_label") or "지급 주기", d["support_cycle"]))
     if badges:

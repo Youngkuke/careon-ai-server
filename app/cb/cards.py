@@ -151,15 +151,22 @@ def to_detail(row: Dict[str, Any]) -> Dict[str, Any]:
         "support_cycle": support_cycle,
         "support_cycle_label": SUPPORT_CYCLE_LABEL if support_cycle else None,
         "provision_type_badge": _text(row.get("provision_type")),
-        "apply_method_badge": _text(row.get("apply_method_nm")),
-        "apply_method_detail": _text(row.get("apply_method")),
+        # 신청 방법 2종은 DB 컬럼명을 그대로 쓴다.
+        "apply_method_nm": _text(row.get("apply_method_nm")),
+        "apply_method": _text(row.get("apply_method")),
         # 배치가 만들어 둔 쉬운 말 신청 가이드. 가공하지 않고 그대로 내보낸다.
         # _text를 거치는 것은 앞뒤 공백 정리와 빈 문자열 → None 뿐이다.
         "apply_guide_easy": _text(row.get("apply_guide_easy")),
 
+        # 신청 일정 3종. 수시(194건)는 셋 다 없다.
+        "apply_period_start": _text(row.get("apply_period_start")),
+        "apply_deadline": _text(row.get("apply_deadline")),
+        "result_announcement_date": _text(row.get("result_announcement_date")),
+
         "contact": None if multiple else _text(row.get("contact")),
         "contact_list": contacts if multiple else None,
         "required_forms": _required_forms(extra_info) or None,
+        "required_documents": _required_documents(row.get("required_documents_ai")) or None,
 
         "target_detail": _text(row.get("target_detail")),
         "select_criteria": _text(row.get("select_criteria")),
@@ -214,6 +221,28 @@ def _contact_entries(extra_info: Dict[str, Any]) -> List[Dict[str, Optional[str]
         phone = _text(item.get("value"))
         if phone:
             out.append({"name": _text(item.get("name")), "phone": phone})
+    return out
+
+
+def _required_documents(value: Any) -> List[Dict[str, Optional[str]]]:
+    """required_documents_ai(JSONB) → 응답용 목록.
+
+    배치가 넣은 값을 그대로 내보낸다. url이 없는 항목은 url/url_type 키를
+    빼서, 응답 전체의 '값이 없으면 키도 없다' 규칙과 어긋나지 않게 한다.
+    """
+    out: List[Dict[str, Optional[str]]] = []
+    for item in value or []:
+        if not isinstance(item, dict):
+            continue
+        name = _text(item.get("name"))
+        if not name:
+            continue
+        doc: Dict[str, Optional[str]] = {"name": name}
+        url = _text(item.get("url"))
+        if url:
+            doc["url"] = url
+            doc["url_type"] = _text(item.get("url_type"))
+        out.append(doc)
     return out
 
 

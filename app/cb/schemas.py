@@ -181,6 +181,21 @@ class RequiredForm(BaseModel):
     url: Optional[str] = None           # 다운로드 링크. 없으면 키 자체가 빠진다
 
 
+class RequiredDocument(BaseModel):
+    """필요 서류 한 줄 (required_documents_ai).
+
+    url은 자주 비어 있다 — 신분증·통장사본·진단서처럼 온라인 발급이라는
+    개념이 없는 서류가 가장 흔하기 때문이다. 링크가 있는 것만 누를 수 있게
+    그리면 된다.
+    """
+
+    name: str
+    url: Optional[str] = None
+    # form_download(서식 다운로드) | certificate_issuance(증명서 발급처)
+    # | info_page(안내). url이 없으면 이 값도 없다.
+    url_type: Optional[str] = None
+
+
 class InstitutionDetail(BaseModel):
     """상세 화면 한 장을 그리는 데 필요한 것 전부.
 
@@ -189,8 +204,9 @@ class InstitutionDetail(BaseModel):
     2단으로 쪼개 쓴다. 상속하면 support.cycle과 support_cycle이 함께 나가서
     프론트가 어느 쪽을 믿어야 할지 모르게 된다.
 
-    필드명은 DB 컬럼명을 따른다. 한 컬럼이 화면에서 두 역할로 갈라질 때만
-    역할 접미사를 붙인다 (apply_method → apply_method_badge/_detail).
+    필드명은 DB 컬럼명을 그대로 쓴다. 같은 값을 두 이름으로 부르지 않기
+    위해서다 — apply_method_nm(짧은 라벨)과 apply_method(절차 전문)는
+    애초에 다른 컬럼이라 이름만으로 구분된다.
 
     비어 있는 값은 null이 아니라 '키 자체가 없는' 상태로 나간다
     (라우터의 response_model_exclude_none). 프론트는 값 검사 없이 키 존재
@@ -216,19 +232,34 @@ class InstitutionDetail(BaseModel):
     support_cycle: Optional[str] = None         # 년 | 월 | 1회성 | 수시
     support_cycle_label: Optional[str] = None   # 항상 "지급 주기". 값이 있을 때만 나간다
     provision_type_badge: Optional[str] = None  # 현금지급 | 현물지급 | 기타
-    apply_method_badge: Optional[str] = None    # apply_method_nm. 짧은 라벨(예: "방문")
-    apply_method_detail: Optional[str] = None   # apply_method. 절차 전문
+    # 신청 방법 2종. 둘 다 DB 컬럼명을 그대로 쓴다.
+    #   apply_method_nm  짧은 라벨(예: "방문"). 856건 중 729건(85%)에 있다.
+    #   apply_method     절차 전문. 856건 중 797건(93%)에 있다.
+    apply_method_nm: Optional[str] = None
+    apply_method: Optional[str] = None
     # 신청 절차를 쉬운 말로 푼 가이드. 배치가 미리 만들어 둔 값이라 이 응답에
-    # 실려 온다(말풍선 A와 달리 캐시된다). apply_method_detail 원문을 대체하지
+    # 실려 온다(말풍선 A와 달리 캐시된다). apply_method 원문을 대체하지
     # 않고 나란히 나간다. 값이 없으면 다른 필드와 마찬가지로 키가 빠진다.
     apply_guide_easy: Optional[str] = None
+
+    # --- 신청 일정 ----------------------------------------------------------
+    # 'YYYY-MM-DD' 문자열. support_cycle='수시'인 194건은 마감 개념이 없어
+    # 셋 다 없다 — 그때는 화면에서 '상시 접수'로 그린다.
+    # 신청 기간 = apply_period_start ~ apply_deadline 이다.
+    apply_period_start: Optional[str] = None
+    apply_deadline: Optional[str] = None
+    result_announcement_date: Optional[str] = None
 
     # 문의처는 둘 중 하나만 나간다. 연락처가 2곳 이상이면 contact를 빼고
     # contact_list로 대체한다 — 대표 1개만 보여주면 나머지 창구가 숨는다.
     contact: Optional[str] = None
     contact_list: Optional[List[ContactEntry]] = None
 
+    # 복지로가 준 실제 첨부 서식.
     required_forms: Optional[List[RequiredForm]] = None
+    # 신청할 때 준비해야 하는 서류. 빈 배열이면(신청을 받지 않는 제도 29건)
+    # 키가 빠진다 — 프론트가 섹션을 통째로 숨기면 된다.
+    required_documents: Optional[List[RequiredDocument]] = None
 
     # --- 아코디언 본문 ------------------------------------------------------
     # 셋 다 가공하지 않은 원문이다. 검색·랭킹이 읽는 텍스트와 한 글자도
