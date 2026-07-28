@@ -218,6 +218,10 @@ class InstitutionDetail(BaseModel):
     provision_type_badge: Optional[str] = None  # 현금지급 | 현물지급 | 기타
     apply_method_badge: Optional[str] = None    # apply_method_nm. 짧은 라벨(예: "방문")
     apply_method_detail: Optional[str] = None   # apply_method. 절차 전문
+    # 신청 절차를 쉬운 말로 푼 가이드. 배치가 미리 만들어 둔 값이라 이 응답에
+    # 실려 온다(말풍선 A와 달리 캐시된다). apply_method_detail 원문을 대체하지
+    # 않고 나란히 나간다. 값이 없으면 다른 필드와 마찬가지로 키가 빠진다.
+    apply_guide_easy: Optional[str] = None
 
     # 문의처는 둘 중 하나만 나간다. 연락처가 2곳 이상이면 contact를 빼고
     # contact_list로 대체한다 — 대표 1개만 보여주면 나머지 창구가 숨는다.

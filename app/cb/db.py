@@ -143,7 +143,11 @@ async def fetch_institution(serv_id: str) -> Optional[Dict[str, Any]]:
             "       ctpv_nm, sgg_nm, region_scope, "
             "       target_detail, select_criteria, service_content, apply_method, "
             "       extra_info, jur_org_nm, support_cycle, provision_type, "
-            "       apply_method_nm, detail_link, contact, criteria_year, is_active "
+            "       apply_method_nm, detail_link, contact, criteria_year, is_active, "
+            # 배치가 채운 값이지만 상세 조회는 '읽어서 그대로 내보내는' 경로다.
+            # 실시간 답변(nodes/explain/prompts)이 읽지 않는다는 004의 원칙과는
+            # 무관하다 — 그쪽은 LLM이 근거로 삼는 것을 막는 규칙이다.
+            "       apply_guide_easy "
             "FROM cb.cb_institutions WHERE serv_id = $1",
             serv_id,
         )

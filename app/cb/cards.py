@@ -153,6 +153,9 @@ def to_detail(row: Dict[str, Any]) -> Dict[str, Any]:
         "provision_type_badge": _text(row.get("provision_type")),
         "apply_method_badge": _text(row.get("apply_method_nm")),
         "apply_method_detail": _text(row.get("apply_method")),
+        # 배치가 만들어 둔 쉬운 말 신청 가이드. 가공하지 않고 그대로 내보낸다.
+        # _text를 거치는 것은 앞뒤 공백 정리와 빈 문자열 → None 뿐이다.
+        "apply_guide_easy": _text(row.get("apply_guide_easy")),
 
         "contact": None if multiple else _text(row.get("contact")),
         "contact_list": contacts if multiple else None,
