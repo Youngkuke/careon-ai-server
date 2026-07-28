@@ -274,6 +274,105 @@ async def save_grading(items: Sequence[Dict[str, Any]]) -> int:
     return len(items)
 
 
+# --- 데모용 백필 (004 마이그레이션) -------------------------------------------
+# 아래 4개 함수는 오프라인 배치 스크립트 전용이다. 실시간 답변 경로
+# (nodes.py / search.py / explain.py)에서 부르지 않는다 — 004 주석 참고.
+async def fetch_rows_for_deadline() -> List[Dict[str, Any]]:
+    """데모 마감일 백필 대상. support_cycle로 두 갈래를 나누는 판단은 스크립트가 한다."""
+    pool = await connect()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT serv_id, serv_nm, support_cycle FROM cb.cb_institutions "
+            "ORDER BY serv_id"
+        )
+    return [dict(r) for r in rows]
+
+
+async def save_demo_deadlines(items: Sequence[Dict[str, Any]]) -> int:
+    """날짜 3종을 한 번에 저장한다.
+
+    셋을 항상 함께 쓴다. 하나만 갱신하면 '시작일은 새 값, 마감일은 옛 값'처럼
+    앞뒤가 안 맞는 조합이 생긴다. apply_period_end는 컬럼이 없다 —
+    apply_deadline에서 파생시킨다(004 마이그레이션 주석).
+    """
+    if not items:
+        return 0
+    pool = await connect()
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            "UPDATE cb.cb_institutions "
+            "SET apply_period_start = $2, apply_deadline = $3, "
+            "    result_announcement_date = $4, is_demo_deadline = $5 "
+            "WHERE serv_id = $1",
+            [
+                (
+                    it["serv_id"],
+                    it["apply_period_start"],
+                    it["apply_deadline"],
+                    it["result_announcement_date"],
+                    it["is_demo_deadline"],
+                )
+                for it in items
+            ],
+        )
+    return len(items)
+
+
+async def fetch_rows_for_required_documents(
+    only_missing: bool = False,
+) -> List[Dict[str, Any]]:
+    """필요서류 백필 대상.
+
+    extra_info를 통째로 들고 온다. 근거의 대부분이 basfrm(복지로가 준 실제
+    서식 파일명)에 있어서, 이게 없으면 LLM이 추정만으로 채우게 된다.
+    """
+    pool = await connect()
+    query = (
+        "SELECT serv_id, serv_nm, serv_dgst, target_detail, select_criteria, "
+        "       service_content, apply_method, jur_org_nm, ctpv_nm, sgg_nm, "
+        "       extra_info, detail_link, provision_type "
+        "FROM cb.cb_institutions"
+    )
+    if only_missing:
+        # 중단된 배치를 이어서 돌릴 때. []는 '근거 없음'으로 이미 판정이 끝난
+        # 상태라 다시 돌리지 않는다 — NULL(미실행)만 대상이다.
+        query += " WHERE required_documents_ai IS NULL"
+    query += " ORDER BY serv_id"
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(query)
+    out = []
+    for row in rows:
+        item = dict(row)
+        if isinstance(item.get("extra_info"), str):
+            item["extra_info"] = json.loads(item["extra_info"] or "{}")
+        out.append(item)
+    return out
+
+
+async def save_required_documents(items: Sequence[Dict[str, Any]]) -> int:
+    """[{serv_id, documents: list[str], source}] 를 저장한다."""
+    if not items:
+        return 0
+    pool = await connect()
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            "UPDATE cb.cb_institutions "
+            "SET required_documents_ai = $2::jsonb, "
+            "    required_documents_source = $3, "
+            "    required_documents_generated_at = now() "
+            "WHERE serv_id = $1",
+            [
+                (
+                    it["serv_id"],
+                    json.dumps(it["documents"], ensure_ascii=False),
+                    it["source"],
+                )
+                for it in items
+            ],
+        )
+    return len(items)
+
+
 async def update_tags(serv_id: str, tags: Dict[str, List[str]]) -> None:
     """LLM으로 보완한 3종 태그를 반영하고 tags_source를 llm으로 표시한다."""
     pool = await connect()
