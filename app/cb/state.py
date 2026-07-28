@@ -48,6 +48,23 @@ class CbState(TypedDict, total=False):
     # 상태·등급을 한 번 물었는가. 같은 질문을 두 번 하지 않기 위한 표시.
     narrow_asked: bool
 
+    # --- 자격 축: 장애 정도와 소득 구간 -----------------------------------------
+    # conditions('장애등록이 있다/없다')와 **별개 축**이다. 있다/없다와 정도를
+    # 한 슬롯에 합치면 "장애는 있는데 정도는 모름"이라는 가장 흔한 상태를
+    # 표현할 수 없다 (제도 쪽도 같은 이유로 컬럼을 나눴다 — 003 마이그레이션).
+    #
+    # 값은 사용자가 스스로 규정한 것이 아니라, 우회 질문("지금 받고 계신 지원이
+    # 있으세요?")의 답에서 LLM이 앵커 제도명을 보고 역추론한 것이다.
+    # 이용자 상당수가 자기가 어떤 행정 카테고리에 속하는지 모르기 때문이다.
+    #
+    # LLM은 여기까지(분류)만 하고, %로 바꾸는 변환과 856건과의 판정은
+    # 전부 코드가 한다 (app/cb/grading.py).
+    income_category: Optional[str]          # 생계급여 | 의료급여 | ... | 해당없음 | 모름
+    disability_severity_hint: Optional[str]  # 심한 | 심하지않은 | 모름
+    # 사용자가 자발적으로 밝혔을 때만 채워지는 보조 경로. 캐묻지 않는다.
+    monthly_income: Optional[int]           # 가구 월소득(원)
+    household_size: Optional[int]           # 가구원수
+
     # 지역은 누적 대상이 아니다. cb_user_profile에서 1회 복사한 뒤 고정이다.
     region_sgg: Optional[str]
 
@@ -122,6 +139,8 @@ def initial_state(user_id: int, region_sgg: Optional[str] = None) -> CbState:
         messages=[],
         life_cycle=[], household=[], theme=[],
         conditions=[], denied_conditions=[], narrow_asked=False,
+        income_category=None, disability_severity_hint=None,
+        monthly_income=None, household_size=None,
         region_sgg=region_sgg,
         target_for=None,
         age=None,

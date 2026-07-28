@@ -235,6 +235,45 @@ async def save_embeddings(items: Sequence[Dict[str, Any]]) -> int:
     return len(items)
 
 
+async def fetch_rows_for_grading() -> List[Dict[str, Any]]:
+    """장애 중증도·소득 구간 백필 대상 (scripts/backfill_grading.py).
+
+    is_active 여부로 거르지 않는다. 내린 제도도 저장해 둔 유저가 열어볼 수
+    있고, 그때 자격 표시가 비어 있으면 안 된다.
+    """
+    pool = await connect()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT serv_id, serv_nm, serv_dgst, target_detail, select_criteria, "
+            "       household_tags, disability_severity, income_pct_max "
+            "FROM cb.cb_institutions ORDER BY serv_id"
+        )
+    return [dict(r) for r in rows]
+
+
+async def save_grading(items: Sequence[Dict[str, Any]]) -> int:
+    """[{serv_id, disability_severity, income_pct_max}] 를 저장한다.
+
+    임베딩은 건드리지 않는다. 이 두 컬럼은 임베딩 텍스트에 들어가지 않으므로
+    (normalize.embedding_text 참고) content_hash가 바뀌지 않고, 재임베딩할
+    이유도 없다.
+    """
+    if not items:
+        return 0
+    pool = await connect()
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            "UPDATE cb.cb_institutions "
+            "SET disability_severity = $2, income_pct_max = $3 "
+            "WHERE serv_id = $1",
+            [
+                (it["serv_id"], it["disability_severity"], it["income_pct_max"])
+                for it in items
+            ],
+        )
+    return len(items)
+
+
 async def update_tags(serv_id: str, tags: Dict[str, List[str]]) -> None:
     """LLM으로 보완한 3종 태그를 반영하고 tags_source를 llm으로 표시한다."""
     pool = await connect()

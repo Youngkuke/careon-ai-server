@@ -11,7 +11,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from app.cb import cards, constants, eligibility, embedding, prompts, search
+from app.cb import cards, constants, eligibility, embedding, grading, prompts, search
 from app.cb.config import cb_settings
 from app.cb.state import CbState, active_filters, has_any_filter, merge_tags
 
@@ -54,6 +54,22 @@ _INTENT_SCHEMA = {
         "age": {"type": ["integer", "null"]},
         "caree_age": {"type": ["integer", "null"]},
         "target_for": {"type": ["string", "null"], "enum": constants.TARGET_FOR_VALUES + [None]},
+        # 자격 축. conditions와 달리 '있다/없다'가 아니라 '정도'와 '구간'이다.
+        # 사용자가 스스로 카테고리를 말하는 일은 드물고, 대개 우회 질문의 답에
+        # 나온 앵커 제도명("자활근로 나가요")에서 역추론된다.
+        "income_category": {
+            "type": ["string", "null"],
+            "enum": grading.INCOME_CATEGORIES + [None],
+        },
+        "income_category_evidence": {"type": "string"},
+        "disability_severity_hint": {
+            "type": ["string", "null"],
+            "enum": grading.SEVERITY_HINTS + [None],
+        },
+        "disability_severity_evidence": {"type": "string"},
+        # 사용자가 자발적으로 밝혔을 때만. 묻지 않는다.
+        "monthly_income": {"type": ["integer", "null"]},
+        "household_size": {"type": ["integer", "null"]},
         # target_for의 근거가 된 사용자 발화 구절. 없으면 빈 문자열.
         #
         # 이 필드가 없을 때 LLM은 근거 없이 self를 채웠다. 실측(2026-07-27)에서
@@ -65,7 +81,10 @@ _INTENT_SCHEMA = {
     },
     "required": ["life_cycle", "household", "theme",
                  "conditions", "denied_conditions", "query_text", "ready",
-                 "age", "caree_age", "target_for", "target_for_evidence"],
+                 "age", "caree_age", "target_for", "target_for_evidence",
+                 "income_category", "income_category_evidence",
+                 "disability_severity_hint", "disability_severity_evidence",
+                 "monthly_income", "household_size"],
     "additionalProperties": False,
 }
 
@@ -125,12 +144,16 @@ def _known_block(state: CbState) -> str:
         "관심주제: %s" % (", ".join(filters["theme"]) or "(없음)"),
         "해당한다고 밝힌 자격: %s" % (", ".join(state.get("conditions") or []) or "(없음)"),
         "해당 없다고 밝힌 자격: %s" % (", ".join(state.get("denied_conditions") or []) or "(없음)"),
+        "받고 있는 급여 구분: %s" % (state.get("income_category") or "(아직 모름)"),
+        "장애 정도: %s" % (state.get("disability_severity_hint") or "(아직 모름)"),
         "",
         "[고를 수 있는 값]",
         "생애주기: %s" % ", ".join(constants.LIFE_CYCLE_TAGS),
         "가구상황: %s" % ", ".join(constants.HOUSEHOLD_TAGS),
         "관심주제: %s" % ", ".join(constants.THEME_TAGS),
         "상태·등급: %s" % ", ".join(constants.CONDITION_TAGS),
+        "급여 구분: %s" % ", ".join(grading.INCOME_CATEGORIES),
+        "장애 정도: %s" % ", ".join(grading.SEVERITY_HINTS),
     ]
     return "\n".join(lines)
 
@@ -204,6 +227,8 @@ async def extract_intent(state: CbState) -> Dict[str, Any]:
     if caree_age is not None and state.get("caree_age") is None:
         update["caree_age"] = caree_age
 
+    update.update(_grounded_grading(raw, state))
+
     # 나이를 알면 생애주기가 확정된다. 본인과 돌보는 분의 생애주기를 **둘 다** 넣는다.
     #
     # 전에는 돌봄 대상을 찾는 중이면 본인 생애주기를 일부러 뺐다. 그랬더니
@@ -255,6 +280,69 @@ def _grounded_target(raw: Dict[str, Any], state: CbState) -> Optional[str]:
     if current is not None and current != target_for:
         logger.info("[intent] 대상 갱신 %s → %s (근거=%r)", current, target_for, evidence[:30])
     return target_for
+
+
+def _grounded_grading(raw: Dict[str, Any], state: CbState) -> Dict[str, Any]:
+    """자격 축(소득 구간·장애 정도)을 근거가 있을 때만 확정한다.
+
+    target_for와 같은 패턴이다. 근거 구절이 비어 있으면 확정하지 않는다 —
+    이 값들은 사용자가 직접 말하기보다 앵커 제도명("자활근로 나가요")에서
+    역추론되는 것이라, 근거를 함께 받지 않으면 LLM이 분위기로 채운 것과
+    실제 답을 구별할 수 없다.
+
+    한 번 확정된 값은 근거가 새로 있을 때만 바뀐다. 대화 주제가 옮겨가면
+    LLM이 null을 돌려주는데, 그것만으로 지워지면 다시 물어야 한다.
+
+    '모름'과 '해당없음'도 답이므로 그대로 저장한다. 저장해 두지 않으면 이미
+    답한 것을 프롬프트가 '(아직 모름)'으로 보여주고 또 묻게 된다.
+    """
+    update: Dict[str, Any] = {}
+
+    pairs = (
+        ("income_category", "income_category_evidence", grading.INCOME_CATEGORIES),
+        ("disability_severity_hint", "disability_severity_evidence",
+         grading.SEVERITY_HINTS),
+    )
+    for field, evidence_field, allowed in pairs:
+        value = raw.get(field)
+        if value not in allowed:
+            continue
+        evidence = (raw.get(evidence_field) or "").strip()
+        if not evidence:
+            if state.get(field) is None:
+                logger.info("[intent] %s=%s 은 근거가 없어 확정하지 않는다", field, value)
+            continue
+        current = state.get(field)
+        if current is not None and current != value:
+            logger.info("[intent] %s 갱신 %s → %s (근거=%r)",
+                        field, current, value, evidence[:30])
+        update[field] = value
+
+    # 소득 숫자는 자발적으로 밝혔을 때만 온다. 한 번 확정되면 덮어쓰지 않는다.
+    income = raw.get("monthly_income")
+    if isinstance(income, int) and not isinstance(income, bool) \
+            and 0 < income <= 100_000_000 and state.get("monthly_income") is None:
+        update["monthly_income"] = income
+    size = raw.get("household_size")
+    if isinstance(size, int) and not isinstance(size, bool) \
+            and 0 < size <= 20 and state.get("household_size") is None:
+        update["household_size"] = size
+
+    return update
+
+
+def user_income_pct(state: CbState) -> Optional[int]:
+    """사용자의 기준중위소득 %. 모르면 None.
+
+    카테고리를 숫자 계산보다 우선한다. '차상위계층'은 행정이 확인해 준
+    사실이지만, 월소득은 세전/세후·상여 포함 여부·가구원수 착오가 섞여
+    사용자가 잘못 말하기 쉽다. 둘 다 있으면 확인된 쪽을 믿는다.
+    """
+    from_category = grading.user_income_pct(state.get("income_category"))
+    if from_category is not None:
+        return from_category
+    return grading.pct_from_income(
+        state.get("monthly_income"), state.get("household_size"))
 
 
 def _valid_age(value: Any) -> Optional[int]:
@@ -397,11 +485,26 @@ async def ask_narrow(state: CbState) -> Dict[str, Any]:
     진단명은 묻지 않는다. 사용자가 먼저 말하면 그때 검색어에 실린다.
     """
     for_caree = state.get("target_for") == constants.TARGET_CAREE
+    who = "돌보시는 분" if for_caree else "본인"
+
+    # 장애가 이미 확인됐으면 등록 여부를 또 묻는 대신 '지금 받고 있는 지원'을
+    # 묻는다. 자기 장애 정도나 급여 구분을 아는 사람은 드물지만, 받고 있는
+    # 제도 이름은 대개 정확히 안다. 그 이름에서 정도와 소득 구간이 역추론된다
+    # (app/cb/prompts/intent_extract.md의 앵커 제도 목록).
+    disability_known = (
+        "장애등록" in (state.get("conditions") or [])
+        or "장애인" in (state.get("household") or [])
+    )
+    if disability_known:
+        ask = ("%s이 지금 받고 계신 지원(활동지원서비스, 장애인연금, 장애수당 등)의 "
+               "이름. 정도나 등급을 직접 묻지 말 것." % who)
+    else:
+        ask = "%s의 장기요양등급 또는 장애등록 여부" % who
+
     messages = [
         {"role": "system", "content": prompts.load("narrow")},
         {"role": "system", "content": _known_block(state)},
-        {"role": "system", "content": "[이번 턴에 확인할 것] %s의 장기요양등급 또는 장애등록 여부" % (
-            "돌보시는 분" if for_caree else "본인")},
+        {"role": "system", "content": "[이번 턴에 확인할 것] %s" % ask},
     ] + _history(state)
 
     try:
@@ -419,15 +522,19 @@ async def ask_narrow(state: CbState) -> Dict[str, Any]:
         text = ""
 
     if not text:
-        text = (
-            "찾기 전에 하나만 여쭤볼게요. 돌보시는 분이 장기요양등급이나 "
-            "장애 등록을 받으셨을까요? 아직이시거나 모르시면 그렇게만 알려주셔도 돼요."
-            if for_caree else
-            "찾기 전에 하나만 여쭤볼게요. 혹시 장애 등록이나 기초생활수급에 "
-            "해당되실까요? 아니거나 모르시면 그렇게만 알려주셔도 돼요."
-        )
+        if disability_known:
+            text = ("찾기 전에 하나만 여쭤볼게요. 활동지원서비스나 장애인연금처럼 "
+                    "%s이 지금 받고 계신 지원이 있으실까요? "
+                    "이름이 정확하지 않아도 괜찮아요." % ("돌보시는 분" if for_caree else "본인"))
+        elif for_caree:
+            text = ("찾기 전에 하나만 여쭤볼게요. 돌보시는 분이 장기요양등급이나 "
+                    "장애 등록을 받으셨을까요? 아직이시거나 모르시면 그렇게만 알려주셔도 돼요.")
+        else:
+            text = ("찾기 전에 하나만 여쭤볼게요. 혹시 장애 등록이나 기초생활수급에 "
+                    "해당되실까요? 아니거나 모르시면 그렇게만 알려주셔도 돼요.")
 
-    logger.info("[narrow] 상태·등급 확인 질문 (대상=%s)",
+    logger.info("[narrow] %s 확인 질문 (대상=%s)",
+                "받는 지원(우회)" if disability_known else "상태·등급",
                 "돌봄대상" if for_caree else "본인")
     return {"answer": text, "narrow_asked": True, "phase": "gathering"}
 
@@ -543,6 +650,15 @@ def _rerank(rows: List[Dict[str, Any]], state: CbState,
         user_text=" ".join([query_text] + _user_texts(state)),
         user_household=state.get("household") or [],
         denied=state.get("denied_conditions") or [],
+    )
+    # 확인된 자격 축(장애 정도·소득 구간)으로 올리고 내린다. 목록에서 빼지는
+    # 않는다 — 제도 쪽 값의 61%가 카테고리명 사전 매핑에서 온 것이라
+    # 제외까지 맡길 만큼 단단하지 않다 (eligibility.INCOME_OVER_FACTOR 주석).
+    rows = eligibility.grading_adjust(
+        rows,
+        severity=grading.severity_from_hint(state.get("disability_severity_hint")),
+        income_pct=user_income_pct(state),
+        income_floor=grading.user_income_floor(state.get("income_category")),
     )
     rows.sort(key=lambda r: (-(r.get("rrf") or 0.0),
                              r.get("dist") if r.get("dist") is not None else 9.0))

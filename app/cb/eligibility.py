@@ -26,7 +26,9 @@ A는 목록에서 뺀다. B는 순위만 낮춘다.
 그 그룹은 감점도 제외도 하지 않는다.
 """
 import logging
-from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+from app.cb import grading
 
 logger = logging.getLogger(__name__)
 
@@ -235,3 +237,104 @@ def apply(
     for note in dropped:
         logger.debug("[eligibility] 제외: %s", note)
     return kept
+
+
+# --- C. 장애 중증도 / 소득 구간 (003 마이그레이션으로 구조화한 축) ----------------
+# 위 A·B와 다른 점: 여기서는 **가산도 한다**. A·B는 "어긋나는 것을 걷어내는"
+# 필터라 감점·제외뿐이었는데, 중증도와 소득은 사용자가 직접 밝힌 값과 제도
+# 원문의 값이 맞아떨어지는 순간이 있고, 그건 유사도보다 강한 자격 신호다.
+#
+# 값의 출처는 cb.cb_institutions.disability_severity / income_pct_max이고
+# scripts/backfill_grading.py가 원문 regex + 법정 사전으로 채운다. LLM이
+# 개입하지 않으므로 같은 입력에는 항상 같은 순위가 나온다.
+SEVERITY_MATCH_BOOST = 1.3
+# 중증도가 명시적으로 어긋날 때. 제외하지 않는다 — '심하지 않은 장애인' 전용
+# 제도라도 신청 시점에 재판정을 받는 경우가 있고, 무엇보다 사용자가 자기
+# 등급을 잘못 알고 있을 수 있다.
+SEVERITY_MISMATCH_FACTOR = 0.7
+
+INCOME_MATCH_BOOST = 1.3
+# 사용자 소득 구간이 제도 상한을 넘을 때. 이것도 제외하지 않는다.
+#
+# income_pct_max의 61%(181/298건)는 원문의 %가 아니라 카테고리명 사전 매핑에서
+# 왔고, 그중 일부는 자격 상한이 아니라 '대상 예시'다. 실측:
+#   「찾아가는 복지 방문 강화 사업」의 "기초생활수급자, 독거어르신, 장애인,
+#    한부모가족 등 사회취약계층" → 32%로 잡혔지만 32% 상한 제도가 아니다.
+# 이 값으로 제외까지 하면 정작 그 사업이 필요한 차상위 사용자에게서 사라진다.
+# 그래서 A그룹(원문에 자격이 박힌 건)과 달리 감점에서 멈춘다.
+# 대신 배율은 A와 같은 0.5로 둬서 맞춤 구간 밖으로 확실히 밀어낸다.
+INCOME_OVER_FACTOR = 0.5
+# 사용자가 "수급·차상위 어디에도 해당 없다"고만 답한 경우. 정확한 %를 모르고
+# 50% 초과라는 하한만 아는 상태라 더 약하게 매긴다.
+INCOME_LIKELY_OVER_FACTOR = 0.7
+
+
+def grading_adjust(
+    rows: List[Dict[str, Any]],
+    *,
+    severity: Optional[str] = None,
+    income_pct: Optional[int] = None,
+    income_floor: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """확인된 중증도·소득 구간으로 순위를 올리고 내린다. 목록에서 빼지는 않는다.
+
+    세 인자 모두 None이면 아무것도 하지 않는다. 사용자가 말하지 않은 대화에서는
+    기존 동작 그대로여야 한다(회귀 없음).
+
+    제도 쪽 값이 없거나(NULL) 'unknown'이면 손대지 않는다. NULL은 '제한 없음'이
+    아니라 '원문에 근거 없음'이고, unknown은 '장애인 대상이지만 정도를 안 가림'
+    이다. 둘 다 기존 장애등록 여부 로직(DENIABLE_GROUPS)이 계속 담당한다.
+
+    정렬은 하지 않는다. 호출부(nodes._rerank)가 모든 신호를 얹은 뒤 한 번만 한다.
+    """
+    if severity is None and income_pct is None and income_floor is None:
+        return rows
+
+    boosted = 0
+    demoted = 0
+    for row in rows:
+        factor = 1.0
+        notes: List[str] = []
+
+        row_severity = row.get("disability_severity")
+        if severity and row_severity in (grading.SEVERE, grading.MILD):
+            if row_severity == severity:
+                factor *= SEVERITY_MATCH_BOOST
+                notes.append("중증도 일치")
+            else:
+                factor *= SEVERITY_MISMATCH_FACTOR
+                notes.append("중증도 불일치")
+
+        row_income = row.get("income_pct_max")
+        if row_income is not None:
+            if income_pct is not None:
+                if income_pct <= row_income:
+                    factor *= INCOME_MATCH_BOOST
+                    notes.append("소득 기준 충족(%d%%≤%d%%)" % (income_pct, row_income))
+                else:
+                    factor *= INCOME_OVER_FACTOR
+                    notes.append("소득 기준 초과(%d%%>%d%%)" % (income_pct, row_income))
+            elif income_floor is not None and row_income <= income_floor:
+                factor *= INCOME_LIKELY_OVER_FACTOR
+                notes.append("소득 기준 초과 추정(>%d%%)" % income_floor)
+
+        if factor == 1.0:
+            continue
+        row["rrf"] = float(row.get("rrf") or 0.0) * factor
+        row["grading_notes"] = notes
+        # 자격이 확인된 건은 유사도가 조금 멀어도 맞춤에 남겨야 한다.
+        # cards.split_sections가 이 표시를 보고 거리 컷을 건너뛴다.
+        row["grading_confirmed"] = factor > 1.0
+        if factor > 1.0:
+            boosted += 1
+        else:
+            demoted += 1
+
+    if boosted or demoted:
+        logger.info(
+            "[grading] 가산 %d건 / 감점 %d건 (사용자 중증도=%s 소득=%s%s)",
+            boosted, demoted, severity or "미상",
+            f"{income_pct}%" if income_pct is not None else "미상",
+            f" 하한>{income_floor}%" if income_floor is not None else "",
+        )
+    return rows

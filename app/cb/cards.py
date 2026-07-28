@@ -134,7 +134,13 @@ def split_sections(rows: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
     maybe: List[Dict[str, Any]] = []
     for index, row in enumerate(rows, 1):
         card = to_card(row, rank=index)
-        if index <= MATCHED_TOP_N and not _too_far(row.get("dist"), cutoff):
+        # 자격이 확인된 건(중증도·소득 구간이 사용자와 맞아떨어진 건)은 거리 컷을
+        # 면제한다. 거리는 '말이 비슷한가'이고 자격은 '받을 수 있는가'인데,
+        # 후자가 확인됐다면 표현이 좀 달라도 맞춤에 있어야 한다.
+        # 순위 컷(MATCHED_TOP_N)은 그대로 적용한다 — 면제까지 하면 맞춤 섹션이
+        # 8건을 넘어 화면 설계가 깨진다.
+        confirmed = bool(row.get("grading_confirmed"))
+        if index <= MATCHED_TOP_N and (confirmed or not _too_far(row.get("dist"), cutoff)):
             matched.append(card)
         else:
             maybe.append(card)

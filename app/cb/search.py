@@ -178,11 +178,15 @@ WITH base AS (
 -- 나머지 본문(service_content/apply_method)은 상세 API에서만 읽는다.
 -- target_detail은 응답에 나가지 않는다 — 자격이 한정된 제도를 걸러내려면
 -- 태그만으로는 부족해서 서버 안에서만 쓴다 (app/cb/eligibility.py).
+-- disability_severity/income_pct_max도 같은 이유로 읽는다. 이 둘은 WHERE에
+-- 넣지 않는다 — hard filter로 걸면 사용자가 소득을 말하지 않은 대다수 대화에서
+-- 아무 효과가 없거나(값이 없으니까) 반대로 필요한 제도를 통째로 날린다.
+-- 순위 가감은 대화 맥락을 아는 파이썬 쪽에서 한다 (app/cb/eligibility.py).
 SELECT f.serv_id, f.vec_rank, f.lex_rank, f.dist, f.lex_score, f.rrf,
        i.serv_nm, i.source, i.region_scope, i.ctpv_nm, i.sgg_nm, i.serv_dgst,
        i.life_cycle_tags, i.household_tags, i.theme_tags, i.detail_link,
        i.jur_org_nm, i.support_cycle, i.provision_type, i.apply_method_nm, i.contact,
-       i.target_detail
+       i.target_detail, i.disability_severity, i.income_pct_max
 FROM fused f JOIN cb.cb_institutions i ON i.serv_id = f.serv_id
 ORDER BY f.rrf DESC, f.dist NULLS LAST
 LIMIT $9
