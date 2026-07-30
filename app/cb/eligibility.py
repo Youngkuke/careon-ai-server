@@ -337,6 +337,31 @@ DISEASE_BOOST_GROUPS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
 # 한쪽만 세게 줄 이유가 없다.
 DISEASE_MATCH_BOOST = 1.3
 
+# 제도명이 '사용자가 말하지 않은' 질환을 내걸고 있을 때의 감점.
+#
+# 실측(2026-07-31, 페르소나1 — 치매·뇌졸중 돌봄): 「발달장애인 긴급돌봄사업」과
+# 「발달장애인 가족휴식지원사업」이 맞춤 구간에 올라왔다. 돌봄 주제를 넓히면서
+# (intent_extract.md의 보호·돌봄·생활지원 규칙) 후보가 늘었는데, 이것들을
+# 내릴 근거가 아무 데도 없었다 — disease_penalty는 진단 게이트(_RE_DISEASE_GATE)를
+# 통과하는 제도만 보고, 이 둘은 통과하지 않는다.
+#
+# **제도명만 본다.** 본문까지 보면 대상 질환을 여러 개 나열한 제도가 통째로
+# 깎여서, 정작 사용자에게 맞는 제도가 사라진다. 제도명에 병이 박혀 있다는 것은
+# 그 병이 이 제도의 정체라는 뜻이라 근거가 단단하다.
+#
+# 제외하지 않고 감점만 한다. 사용자가 말하지 않았을 뿐 해당할 수도 있다는
+# 이 파일 전체의 원칙이 여기에도 그대로 적용된다.
+DISEASE_MISMATCH_FACTOR = 0.7
+
+
+def mentioned_disease_groups(user_text: str) -> Dict[str, Tuple[str, ...]]:
+    """대화에 나온 질환 그룹 → 제도 원문에서 찾을 표현."""
+    return {
+        group: inst_terms
+        for group, (user_terms, inst_terms) in DISEASE_BOOST_GROUPS.items()
+        if _contains_any(user_text or "", user_terms)
+    }
+
 
 def disease_boost(rows: List[Dict[str, Any]], user_text: str) -> List[Dict[str, Any]]:
     """대화에 나온 질환·상황이 원문에 실제로 적힌 제도를 끌어올린다.
@@ -352,13 +377,69 @@ def disease_boost(rows: List[Dict[str, Any]], user_text: str) -> List[Dict[str, 
 
     정렬은 하지 않는다. 호출부(nodes._rerank)가 모든 신호를 얹은 뒤 한 번만 한다.
     """
-    haystack = user_text or ""
-    mentioned = {
-        group: inst_terms
-        for group, (user_terms, inst_terms) in DISEASE_BOOST_GROUPS.items()
-        if _contains_any(haystack, user_terms)
-    }
+    mentioned = mentioned_disease_groups(user_text)
     if not mentioned:
+        # 질환 이야기가 없는 대화에서는 가산도 감점도 하지 않는다.
+        # 안 그러면 제도명에 병이 든 제도가 모든 대화에서 깎인다.
+        return rows
+
+    boosted = 0
+    demoted = 0
+    for row in rows:
+        serv_nm = row.get("serv_nm") or ""
+        body = " ".join(filter(None, [
+            serv_nm, row.get("target_detail"), row.get("service_content"),
+        ]))
+        hits = [group for group, inst_terms in mentioned.items()
+                if _contains_any(body, inst_terms)]
+        if hits:
+            row["rrf"] = float(row.get("rrf") or 0.0) * DISEASE_MATCH_BOOST
+            row["disease_match"] = hits
+            boosted += 1
+            continue
+
+        # 원문 어디에도 사용자의 병이 없는데 제도명은 다른 병을 내걸고 있다.
+        others = [group for group, (_, inst_terms) in DISEASE_BOOST_GROUPS.items()
+                  if group not in mentioned and _contains_any(serv_nm, inst_terms)]
+        if others:
+            row["rrf"] = float(row.get("rrf") or 0.0) * DISEASE_MISMATCH_FACTOR
+            row["disease_mismatch"] = others
+            demoted += 1
+
+    logger.info("[disease] 대화에 나온 질환=%s → 일치 %d건 가산 / 다른 질환 전용 %d건 감점",
+                ", ".join(sorted(mentioned)), boosted, demoted)
+    return rows
+
+
+# --- A-6. 확인된 자격(conditions)이 원문에 걸릴 때의 가산 ---------------------------
+# DENIABLE_GROUPS는 지금까지 '아니라고 답한 것'을 걷어내는 데만 쓰였다. 반대쪽,
+# 즉 사용자가 **맞다고 답한 것**은 순위에 아무 영향도 주지 않았다 —
+# disease_penalty를 억제하는 데만 쓰이고 끝이었다.
+#
+# 이건 가장 확실한 신호를 버리는 것이다. ask_narrow가 대화의 마지막 한 턴을
+# 써서 받아낸 답이고, 추정이 아니라 사용자의 명시적 답변이다.
+#
+# 실측(2026-07-31, 페르소나1 — 치매·뇌졸중, 장기요양등급 있음):
+#   장기요양을 원문에 언급하는 제도는 856건 중 25건뿐이라 신호가 선명하다.
+#   후보 30건에서 「재가급여」「시설급여」「특별현금급여(가족요양비)」
+#   「가사·간병 방문 지원사업」은 전부 걸리고, 「발달장애인 긴급돌봄사업」
+#   「장애인가족지원센터 긴급돌봄서비스」는 전부 안 걸린다. 이 신호를 안 쓰니
+#   등급을 확인해 놓고도 발달장애 제도가 맞춤 구간에 올라와 있었다.
+#
+# 배율은 다른 가산과 같은 1.3이다. 제외하거나 거리 컷을 면제하지는 않는다 —
+# '장기요양'이라는 말이 원문에 있다는 것이 곧 '이 제도가 당신 것'이라는 뜻은
+# 아니어서(자격 조항일 수도, 배제 조항일 수도 있다) 질환명 일치만큼 강하게 보지 않는다.
+CONDITION_MATCH_BOOST = 1.3
+
+
+def condition_boost(rows: List[Dict[str, Any]],
+                    conditions: Sequence[str]) -> List[Dict[str, Any]]:
+    """사용자가 해당한다고 답한 자격이 원문에 걸린 제도를 끌어올린다.
+
+    정렬은 하지 않는다. 호출부(nodes._rerank)가 모든 신호를 얹은 뒤 한 번만 한다.
+    """
+    groups = {c: DENIABLE_GROUPS[c] for c in (conditions or ()) if c in DENIABLE_GROUPS}
+    if not groups:
         return rows
 
     boosted = 0
@@ -366,16 +447,15 @@ def disease_boost(rows: List[Dict[str, Any]], user_text: str) -> List[Dict[str, 
         body = " ".join(filter(None, [
             row.get("serv_nm"), row.get("target_detail"), row.get("service_content"),
         ]))
-        hits = [group for group, inst_terms in mentioned.items()
-                if _contains_any(body, inst_terms)]
+        hits = [name for name, terms in groups.items() if _contains_any(body, terms)]
         if not hits:
             continue
-        row["rrf"] = float(row.get("rrf") or 0.0) * DISEASE_MATCH_BOOST
-        row["disease_match"] = hits
+        row["rrf"] = float(row.get("rrf") or 0.0) * CONDITION_MATCH_BOOST
+        row["condition_match"] = hits
         boosted += 1
 
-    logger.info("[disease] 대화에 나온 질환=%s → 원문 일치 %d건 가산",
-                ", ".join(sorted(mentioned)), boosted)
+    logger.info("[condition] 확인된 자격=%s → 원문 일치 %d건 가산",
+                ", ".join(sorted(groups)), boosted)
     return rows
 
 
@@ -445,13 +525,22 @@ def penalty_for(
     #
     # 신원 기반 그룹(EXCLUSIVE_GROUPS)에는 적용하지 않는다. 「(산재근로자)케어센터지원」이
     # 서비스내용에 치매를 적었다고 해서 산재근로자가 아닌 사용자가 받을 수 있게 되지는 않는다.
+    #
+    # **제도명이 그 질환을 내걸고 있으면 우회하지 않는다.** 이 단서가 없으면 반대로
+    # 과하다. 실측(2026-07-31, 페르소나1): 「희귀질환자 의료비 지원사업」이 서비스내용
+    # 부수 조항의 "지체 또는 뇌병변 장애의 정도가 심한 장애인"에 걸려 뇌병변 가산을
+    # 받았고, 그 바람에 희귀질환 제외가 통째로 건너뛰어져 맞춤 1위가 됐다.
+    # 제도명에 '희귀질환'이 박혀 있으면 그게 이 제도의 정체이지 곁다리가 아니다.
+    # (eligibility._names_the_disease가 쓰는 것과 같은 판단이다.)
     covers_mentioned = bool(row.get("disease_match"))
+    serv_nm = row.get("serv_nm") or ""
 
-    haystack = "%s %s" % (row.get("serv_nm") or "", row.get("target_detail") or "")
+    haystack = "%s %s" % (serv_nm, row.get("target_detail") or "")
     for group, (inst_terms, _) in _all_groups().items():
         if group in claimed:
             continue
-        if covers_mentioned and group in CONDITION_GROUPS:
+        if (covers_mentioned and group in CONDITION_GROUPS
+                and not _contains_any(serv_nm, inst_terms)):
             continue
         if _contains_any(haystack, inst_terms):
             factor *= EXCLUSIVE_TERM_FACTOR
@@ -469,7 +558,15 @@ def penalty_for(
 
     mine = set(user_household or [])
     narrow = (set(row.get("household_tags") or []) & EXCLUSIVE_HOUSEHOLD) - mine
-    if narrow:
+    # 확인된 자격(장기요양등급 등)이 이 제도 원문에 걸려 있으면 태그 감점을 하지 않는다.
+    # 이 감점의 근거는 태그인데 72%가 LLM이 붙인 것이라 오태깅이 섞여 있고
+    # (바로 위 주석), 반대편에는 사용자가 ask_narrow에서 직접 답한 사실이 있다.
+    # 어느 쪽을 믿을지는 분명하다.
+    #
+    # 실측(2026-07-31, 페르소나1): 「가사·간병 방문 지원사업」이 장기요양·치매에
+    # 모두 걸리고도 '한부모·조손' 태그 감점 때문에 맞춤 구간 밖으로 밀렸다.
+    # 이 제도의 실제 지원대상은 한부모 전용이 아니다.
+    if narrow and not row.get("condition_match"):
         factor *= EXCLUSIVE_HOUSEHOLD_FACTOR
         reasons.extend(sorted(narrow))
 

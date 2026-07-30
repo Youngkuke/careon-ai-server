@@ -10,7 +10,7 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.cb import cards, constants, eligibility, embedding, grading, prompts, search
 from app.cb.config import cb_settings
@@ -616,18 +616,82 @@ _INCOME_STAGE_ASK = {
        "그 밖에 받고 있는 수급. 예/아니오로 닫히지 않게 열린 질문으로 부드럽게 묻는다.",
 }
 
-# 단계는 상한이지 지시가 아니다.
+def _last_bot_text(state: CbState) -> str:
+    """직전에 봇이 한 말. 같은 문장을 두 번 쓰지 않게 하려고 쓴다."""
+    for message in reversed(state.get("messages") or []):
+        role = getattr(message, "type", None) or getattr(message, "role", None)
+        if role in ("ai", "assistant"):
+            content = getattr(message, "content", None)
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+    return ""
+
+
+# 사용자가 소득 이야기를 접겠다고 한 신호.
 #
-# 사용자가 소득 질문에 답하지 않고 다른 이야기를 해도 단계는 올라간다
-# (income_unknown이 그대로라서). 그때 2단계 지시만 주면 LLM은 앞 턴 문장을
-# 그대로 되풀이한다 — 실측(2026-07-31)에서 "그 외에 걸리는 게 더 있으실까요?
-# 지금 받고 계신 지원이 있으시면..."이 두 턴 연속으로 똑같이 나갔다.
-# ask_intake의 [주의]와 같은 장치를 둔다.
-_INCOME_STAGE_NOTE = (
-    "위 단계는 '여기까지 물어도 된다'는 상한이지 반드시 그 단계를 물으라는 뜻이 아니다. "
-    "앞 턴에 이미 소득을 물었는데 사용자가 답하지 않았다면 **같은 문장을 반복하지 마라.** "
-    "훨씬 짧게 한 번만 더 권하거나, 답하기 어려워 보이면 소득 이야기는 접고 "
-    "다른 축(아직 안 나온 관심주제·상황)을 물어라."
+# '모르겠어요'는 여기 넣지 않는다. 그건 거절이 아니라 1단계의 정상적인 답이고
+# (income_category='모름'), 오히려 2단계로 넘어가야 하는 경우다. 여기 담는 것은
+# "말할 수는 있지만 말하지 않겠다"는 뜻의 표현뿐이다.
+_DECLINES = re.compile(
+    r"말(씀)?\s*(드리기|하기)?\s*(는|가|좀)?\s*(어렵|그렇|그래|곤란|싫)"
+    r"|답(하기|변)\s*(는|가|이)?\s*(좀\s*)?어렵"
+    r"|밝히고\s*싶지\s*않|알려드리기\s*(는\s*)?(좀\s*)?(어렵|그렇)"
+    r"|그냥\s*넘어|넘어갈게|패스할|비밀")
+
+
+def converse_focus(state: CbState) -> Tuple[str, Optional[int]]:
+    """이번 turn에 무엇을 물을지 **코드가** 정한다. (지시문, 소득 단계)
+
+    전에는 converse만 초점 없이 돌았다. ask_intake와 ask_narrow는 '이번 턴에
+    확인할 것'을 코드가 계산해서 넘겨주는데, converse는 프롬프트가 매 턴
+    스스로 판단하게 두었다. 그 결과 이미 아는 것을 또 물었다.
+
+    실측(2026-07-31, 페르소나1): 1턴에 "엄마가 치매에 뇌졸중 후유증까지 있어서
+    돌봐드리는 게 힘들다"고 다 말했는데, 4턴과 5턴이 연달아 "어머님을
+    돌보시면서 가장 부담되는 부분이 어떤가요?"로 나갔다. 관심주제가 이미
+    두 개(보호·돌봄·생활지원) 잡혀 있어서 물어봐야 새로 얻을 것이 없는데도
+    프롬프트의 예시 문장을 그대로 복사한 것이다.
+
+    그래서 순서를 코드로 못 박는다. **이미 채워진 슬롯은 건너뛴다.**
+      1. 관심주제가 비었다 → 무엇이 가장 부담되는지 (이때만 묻는다)
+      2. 소득 구간을 아직 못 잡았다 → 1·2·3단계 중 이번 차례
+      3. 둘 다 됐다 → 짧게 마무리
+    """
+    if not (state.get("theme") or []):
+        return ("지금 가장 부담되는 것이 무엇인지. 분야를 일상어로 예를 들어라 "
+                "('월세나 집 문제', '병원비'처럼)."), None
+
+    probes = int(state.get("income_probes") or 0)
+    wrap_up = ("그 외에 더 걸리는 것이 있는지 짧게 확인하고 마무리한다. "
+               "이미 확보한 것은 다시 묻지 않는다.")
+
+    # 이미 물었는데 사용자가 "말씀드리기 어렵다"고 접었다. 다음 단계로 넘어가지
+    # 않는다 — 단계를 올리는 것도 캐묻는 것이다. 단계를 소진시켜 이후 턴에서도
+    # 다시 열리지 않게 한다.
+    #
+    # 프롬프트에도 같은 규칙이 있었지만(converse.md '사용자가 답을 피하면 접는다')
+    # 지켜지지 않았다. 실측(2026-07-31): "그건 좀 말씀드리기 어렵네요" 다음 턴에
+    # 3단계 질문이 그대로 나갔다.
+    if probes >= 1 and _DECLINES.search(_last_user_text(state)):
+        logger.info("[converse] 사용자가 소득 이야기를 접었다 — 더 묻지 않는다")
+        return ("소득 이야기는 접는다. 다시 묻지 말고, 짧게 받아준 뒤 %s" % wrap_up,
+                MAX_INCOME_PROBES)
+
+    if income_unknown(state) and probes < MAX_INCOME_PROBES:
+        stage = probes + 1
+        return _INCOME_STAGE_ASK[stage], stage
+
+    return wrap_up, None
+
+
+# 단계는 상한이지 지시가 아니다. 사용자가 답하지 않고 다른 이야기를 해도
+# 단계는 올라가는데(income_unknown이 그대로라서), 그때 다음 단계 지시만 주면
+# LLM은 앞 턴 문장을 그대로 되풀이한다.
+_CONVERSE_NOTE = (
+    "위는 '여기까지 물어도 된다'는 상한이지 반드시 그것을 물으라는 뜻이 아니다. "
+    "**이미 대화에 나온 것은 절대 다시 묻지 마라.** 사용자가 앞에서 진단명이나 "
+    "상황을 말했으면 그것을 다시 확인하는 질문을 만들지 마라. "
+    "앞 턴에 물었는데 사용자가 답하지 않았다면 훨씬 짧게 한 번만 더 권하거나 접어라."
 )
 
 
@@ -700,17 +764,25 @@ async def converse(state: CbState) -> Dict[str, Any]:
         {"role": "system", "content": _known_block(state)},
     ]
 
-    # 소득이 아직 안 잡혔으면 이번 턴이 몇 단계인지 알려준다. 프롬프트만으로는
-    # LLM이 단계를 세지 못해서 매번 1단계를 되풀이한다.
+    # 이번 턴의 초점은 코드가 정한다 (ask_intake·ask_narrow와 같은 방식).
     update: Dict[str, Any] = {}
-    probes = int(state.get("income_probes") or 0)
-    if income_unknown(state) and probes < MAX_INCOME_PROBES:
-        stage = probes + 1
-        messages.append({"role": "system", "content": "[소득 파악 단계] %s\n%s" % (
-            _INCOME_STAGE_ASK[stage], _INCOME_STAGE_NOTE)})
+    focus, stage = converse_focus(state)
+    messages.append({"role": "system", "content":
+                     "[이번 턴에 확인할 것] %s\n%s" % (focus, _CONVERSE_NOTE)})
+    if stage is not None:
         update["income_probes"] = stage
-        logger.info("[converse] 소득 파악 %d단계", stage)
 
+    # 직전에 한 말을 그대로 보여주고 반복을 막는다. 대화 이력에 이미 들어 있지만
+    # 이력 속의 한 줄로는 힘이 약하다 — 실측에서 자기가 방금 한 질문을 그대로
+    # 다시 냈다. 따로 떼어 명시하면 그 문장을 피해 간다.
+    previous = _last_bot_text(state)
+    if previous:
+        messages.append({"role": "system", "content":
+                         "[직전에 네가 한 말] %s\n"
+                         "이 문장을 다시 쓰지 마라. 같은 것을 또 묻지 마라." % previous})
+
+    logger.info("[converse] 초점=%s%s", focus[:30],
+                " (소득 %d단계)" % stage if stage else "")
     messages += _history(state)
 
     try:
@@ -783,6 +855,9 @@ def _rerank(rows: List[Dict[str, Any]], state: CbState,
     # 둘 다 곱셈이고, 한 제도가 양쪽에 동시에 걸리는 일은 없다
     # (disease_penalty는 '대화에 안 나온' 질환에만 붙는다).
     rows = eligibility.disease_boost(rows, user_text)
+    # ask_narrow가 마지막 한 턴을 써서 받아낸 답이다. 추정이 아니라 명시적
+    # 답변이라 가장 확실한 신호인데, 지금까지 순위에 쓰이지 않고 있었다.
+    rows = eligibility.condition_boost(rows, state.get("conditions") or [])
     # 자격이 어긋나는 건은 여기서 목록에서 빠진다. 그래서 검색은 최종 노출
     # 건수보다 넉넉히 가져온다 (cards.SEARCH_LIMIT).
     rows = eligibility.apply(
