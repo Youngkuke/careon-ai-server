@@ -287,6 +287,9 @@ def split_sections(rows: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
 
     matched: List[Dict[str, Any]] = []
     maybe: List[Dict[str, Any]] = []
+    # 대화에 나온 질환이 원문에 적힌 건. 카드에 필드를 더하지 않고 여기서만 쓴다
+    # (응답 모양은 연동이 끝나서 고정이다).
+    disease_ids: set = set()
     for index, row in enumerate(rows, 1):
         card = to_card(row, rank=index)
         # 자격이 확인된 건(중증도·소득 구간이 사용자와 맞아떨어진 건)은 거리 컷을
@@ -294,27 +297,43 @@ def split_sections(rows: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
         # 후자가 확인됐다면 표현이 좀 달라도 맞춤에 있어야 한다.
         # 순위 컷(MATCHED_TOP_N)은 그대로 적용한다 — 면제까지 하면 맞춤 섹션이
         # 8건을 넘어 화면 설계가 깨진다.
-        confirmed = bool(row.get("grading_confirmed"))
+        # 대화에 나온 질환이 원문에 적혀 있는 건도 같은 이유로 면제한다.
+        # "치매 걸린 부모님" 상담에서 치매 제도의 거리가 0.57까지 벌어지는 일이
+        # 있는데(search.py 첫머리 실측), 그건 말이 안 비슷한 것일 뿐이고
+        # 그 제도가 다루는 병은 사용자가 방금 말한 그 병이다.
+        confirmed = bool(row.get("grading_confirmed")) or bool(row.get("disease_match"))
         if index <= MATCHED_TOP_N and (confirmed or not _too_far(row.get("dist"), cutoff)):
+            if row.get("disease_match"):
+                disease_ids.add(row["serv_id"])
             matched.append(card)
         else:
             maybe.append(card)
 
-    matched.sort(key=_distance_order)
+    matched.sort(key=lambda card: _matched_order(card, disease_ids))
     # 혹시관심은 RRF 순서라 앞에서 자르는 것이 곧 '가장 가능성 있는 것부터'다.
     return matched, maybe[:MAYBE_LIMIT]
 
 
-def _distance_order(card: Dict[str, Any]):
-    """맞춤 섹션 정렬 키: 가까운 것부터, 거리를 모르는 것은 맨 뒤.
+def _matched_order(card: Dict[str, Any], disease_ids: set):
+    """맞춤 섹션 정렬 키.
 
-    거리가 없다는 건 벡터 후보군(search.CANDIDATES건) 안에도 못 들었다는
-    뜻이다. 키워드가 건져 올린 건이라 버리지는 않지만 의미상 가깝다는 근거는
-    없으므로 맨 앞자리를 주지 않는다. 그 안에서는 RRF 순위를 지킨다.
+    1) 대화에 나온 질환이 원문에 적힌 건을 맨 앞에 세운다.
+       거리는 '말이 비슷한가'인데, 사용자가 방금 말한 병을 그대로 다루는
+       제도라면 표현이 좀 달라도 그게 가장 먼저 보여야 할 것이다.
+       (eligibility.disease_boost의 배율만으로는 여기까지 못 온다 —
+        구간을 나누는 것은 RRF 순위이고 이 섹션의 정렬은 distance라
+        배율로 올린 순위가 여기서 다시 풀린다.)
+    2) 그다음은 가까운 것부터, 거리를 모르는 것은 맨 뒤.
+       거리가 없다는 건 벡터 후보군(search.CANDIDATES건) 안에도 못 들었다는
+       뜻이다. 키워드가 건져 올린 건이라 버리지는 않지만 의미상 가깝다는 근거는
+       없으므로 맨 앞자리를 주지 않는다. 그 안에서는 RRF 순위를 지킨다.
     """
     match = card.get("match") or {}
     distance = match.get("distance")
-    return (1, match.get("rank") or 0) if distance is None else (0, distance)
+    tier = 0 if card.get("serv_id") in disease_ids else 1
+    if distance is None:
+        return (tier, 1, match.get("rank") or 0)
+    return (tier, 0, distance)
 
 
 def _too_far(distance: Optional[float], cutoff: Optional[float]) -> bool:

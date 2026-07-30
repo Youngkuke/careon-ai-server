@@ -47,6 +47,10 @@ class CbState(TypedDict, total=False):
     denied_conditions: Annotated[List[str], merge_tags]
     # 상태·등급을 한 번 물었는가. 같은 질문을 두 번 하지 않기 위한 표시.
     narrow_asked: bool
+    # 소득을 물어본 converse 턴 수. 1단계(앵커) → 2단계(대략의 액수) →
+    # 3단계(가구 안팎의 소득)로 넘어갈지 정하고, 동시에 상한이 된다.
+    # 이 값이 없으면 소득 질문이 대화를 끝없이 늘린다.
+    income_probes: int
 
     # --- 자격 축: 장애 정도와 소득 구간 -----------------------------------------
     # conditions('장애등록이 있다/없다')와 **별개 축**이다. 있다/없다와 정도를
@@ -61,7 +65,9 @@ class CbState(TypedDict, total=False):
     # 전부 코드가 한다 (app/cb/grading.py).
     income_category: Optional[str]          # 생계급여 | 의료급여 | ... | 해당없음 | 모름
     disability_severity_hint: Optional[str]  # 심한 | 심하지않은 | 모름
-    # 사용자가 자발적으로 밝혔을 때만 채워지는 보조 경로. 캐묻지 않는다.
+    # 보조 경로. 자발적 발화이거나, 앵커 역추론(income_category)이 실패했을 때
+    # converse가 2단계로 "대략 어느 정도"를 물어 받은 값이다. 캐묻지는 않는다
+    # — 사용자가 답을 피하면 그대로 None으로 둔다 (converse.md 참고).
     monthly_income: Optional[int]           # 가구 월소득(원)
     household_size: Optional[int]           # 가구원수
 
@@ -139,6 +145,7 @@ def initial_state(user_id: int, region_sgg: Optional[str] = None) -> CbState:
         messages=[],
         life_cycle=[], household=[], theme=[],
         conditions=[], denied_conditions=[], narrow_asked=False,
+        income_probes=0,
         income_category=None, disability_severity_hint=None,
         monthly_income=None, household_size=None,
         region_sgg=region_sgg,

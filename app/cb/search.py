@@ -174,10 +174,14 @@ WITH base AS (
          + coalesce($7::float8 / ($8::float8 + l.rank), 0) AS rrf
     FROM vec_rank v FULL OUTER JOIN lex_rank l ON l.serv_id = v.serv_id
 )
--- 결과 카드에 실리는 컬럼 + 자격 판정에 쓰는 지원대상 원문.
--- 나머지 본문(service_content/apply_method)은 상세 API에서만 읽는다.
+-- 결과 카드에 실리는 컬럼 + 자격 판정에 쓰는 원문.
+-- apply_method는 여기서 읽지 않는다. 상세 API에서만 쓴다.
 -- target_detail은 응답에 나가지 않는다 — 자격이 한정된 제도를 걸러내려면
 -- 태그만으로는 부족해서 서버 안에서만 쓴다 (app/cb/eligibility.py).
+-- service_content도 응답에 나가지 않는다. 대화에 나온 질환이 제도 원문에
+-- 실제로 적혀 있는지 볼 때 쓴다(eligibility.disease_boost). 지원대상에는
+-- 연령·거주만 적고 어떤 질환을 다루는지는 서비스내용에만 적는 제도가 있다
+-- (856건 실측: '치매'가 지원대상 8건 / 서비스내용 4건, 겹치지 않는 건이 있다).
 -- select_criteria도 마찬가지로 서버 안에서만 쓴다 — 좁은 질환에 게이트가 걸린
 -- 제도를 찾는 데 필요하다(eligibility.narrow_disease_terms). 지원대상에는
 -- 거주·연령만 적고 진단 요건은 선정기준에 적는 제도가 있다.
@@ -189,7 +193,8 @@ SELECT f.serv_id, f.vec_rank, f.lex_rank, f.dist, f.lex_score, f.rrf,
        i.serv_nm, i.source, i.region_scope, i.ctpv_nm, i.sgg_nm, i.serv_dgst,
        i.life_cycle_tags, i.household_tags, i.theme_tags, i.detail_link,
        i.jur_org_nm, i.support_cycle, i.provision_type, i.apply_method_nm, i.contact,
-       i.target_detail, i.select_criteria, i.disability_severity, i.income_pct_max
+       i.target_detail, i.select_criteria, i.service_content,
+       i.disability_severity, i.income_pct_max
 FROM fused f JOIN cb.cb_institutions i ON i.serv_id = f.serv_id
 ORDER BY f.rrf DESC, f.dist NULLS LAST
 LIMIT $9

@@ -8,6 +8,7 @@
 """
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -67,7 +68,8 @@ _INTENT_SCHEMA = {
             "enum": grading.SEVERITY_HINTS + [None],
         },
         "disability_severity_evidence": {"type": "string"},
-        # 사용자가 자발적으로 밝혔을 때만. 묻지 않는다.
+        # 사용자가 자발적으로 밝혔거나, 앵커 역추론(income_category)이 실패해
+        # converse가 2단계로 대략의 액수를 물었을 때만 채워진다.
         "monthly_income": {"type": ["integer", "null"]},
         "household_size": {"type": ["integer", "null"]},
         # target_for의 근거가 된 사용자 발화 구절. 없으면 빈 문자열.
@@ -89,8 +91,12 @@ _INTENT_SCHEMA = {
 }
 
 # 사용자 발화가 이만큼 쌓이면 더 묻지 않고 검색으로 넘어간다.
-# 되묻기가 길어지면 사용자는 답만 계속 하고 결과를 못 본다.
-MAX_USER_TURNS = 6
+#
+# 6 → 8 (2026-07-31). 데모 목적이 '빠른 대화'가 아니라 '구체적인 상황을
+# 최대한 파악해서 정확한 제도를 추천하는 것'으로 확정됐다. 6턴으로는
+# 소득 1→2→3단계에 상태·등급 질문까지 넣을 예산이 안 나온다
+# (nodes.needs_income_probe의 budget 계산 참고).
+MAX_USER_TURNS = 8
 
 # 대상/나이를 물어볼 수 있는 최대 횟수. 답을 피하는 사람을 붙잡아 두지 않는다.
 # 본인만 찾을 때는 2가지(대상·본인 나이), 돌보는 분을 찾을 때는 3가지
@@ -99,11 +105,11 @@ MAX_INTAKE_QUESTIONS = 3
 
 # 첫 인사. LLM을 부르지 않는다 — 아직 아무 정보가 없어서 LLM이 더 나은 문장을
 # 만들 수 없고, 앱을 열자마자 2~3초를 기다리게 할 이유도 없다.
-GREETING = (
-    "안녕하세요! 필요한 지원을 함께 찾아드릴게요.\n"
-    "요즘 어떤 부분이 가장 부담되세요? 월세나 집 문제, 병원비, 일자리처럼 "
-    "떠오르는 대로 편하게 말씀해 주세요."
-)
+#
+# 주제를 예시로 들지 않는다. "월세·병원비·일자리처럼" 같은 예시는 답하기는
+# 쉽게 만들지만, 사용자가 그 셋 중에서 고르게 만들어 정작 본인 고민이
+# 그 밖에 있을 때 말을 꺼내지 못한다. 열린 질문 하나로만 연다.
+GREETING = "안녕하세요, 여러분의 상황이 궁금해요! 요즘 어떤 게 고민이신가요?"
 
 # 0건일 때 푸는 순서. 가구상황을 먼저 푼다 —
 # '저소득' 같은 값은 사용자가 스치듯 말해도 붙는데, 제도 쪽은 명시적으로
@@ -146,6 +152,11 @@ def _known_block(state: CbState) -> str:
         "해당 없다고 밝힌 자격: %s" % (", ".join(state.get("denied_conditions") or []) or "(없음)"),
         "받고 있는 급여 구분: %s" % (state.get("income_category") or "(아직 모름)"),
         "장애 정도: %s" % (state.get("disability_severity_hint") or "(아직 모름)"),
+        # 소득 파악이 어느 단계까지 왔는지 프롬프트가 보고 판단한다
+        # (app/cb/prompts/converse.md의 '소득 파악은 단계적으로').
+        # 안 보여주면 이미 답한 것을 또 묻는다.
+        "가구 월소득: %s" % (state.get("monthly_income") or "(아직 모름)"),
+        "가구원 수: %s" % (state.get("household_size") or "(아직 모름)"),
         "",
         "[고를 수 있는 값]",
         "생애주기: %s" % ", ".join(constants.LIFE_CYCLE_TAGS),
@@ -341,7 +352,8 @@ def _grounded_grading(raw: Dict[str, Any], state: CbState) -> Dict[str, Any]:
                         field, current, value, evidence[:30])
         update[field] = value
 
-    # 소득 숫자는 자발적으로 밝혔을 때만 온다. 한 번 확정되면 덮어쓰지 않는다.
+    # 소득 숫자는 자발적 발화이거나 converse 2단계 질문의 답이다. 어느 쪽이든
+    # 사용자가 말한 숫자만 온다. 한 번 확정되면 덮어쓰지 않는다.
     income = raw.get("monthly_income")
     if isinstance(income, int) and not isinstance(income, bool) \
             and 0 < income <= 100_000_000 and state.get("monthly_income") is None:
@@ -592,6 +604,91 @@ def is_ready(state: CbState) -> bool:
     return bool(state.get("ready")) or user_turns(state) >= MAX_USER_TURNS
 
 
+# 소득을 물어볼 수 있는 converse 턴의 상한. 1·2·3단계로 딱 한 번씩이다.
+MAX_INCOME_PROBES = 3
+
+# 각 단계에서 무엇을 물을지. converse.md의 '소득 파악은 단계적으로'와 짝이다.
+_INCOME_STAGE_ASK = {
+    1: "1단계 — 지금 받고 계신 지원의 이름 (앵커 제도명). 액수는 묻지 않는다.",
+    2: "2단계 — 대략의 가구 소득. 1단계로 구간이 안 잡혔을 때만이다. "
+       "정확한 액수를 요구하지 말고, 답하기 어려우면 넘어가도 된다고 반드시 덧붙인다.",
+    3: "3단계 — 같이 사는 가족의 소득, 친척에게 받는 비정기적 도움(용돈 등), "
+       "그 밖에 받고 있는 수급. 예/아니오로 닫히지 않게 열린 질문으로 부드럽게 묻는다.",
+}
+
+# 단계는 상한이지 지시가 아니다.
+#
+# 사용자가 소득 질문에 답하지 않고 다른 이야기를 해도 단계는 올라간다
+# (income_unknown이 그대로라서). 그때 2단계 지시만 주면 LLM은 앞 턴 문장을
+# 그대로 되풀이한다 — 실측(2026-07-31)에서 "그 외에 걸리는 게 더 있으실까요?
+# 지금 받고 계신 지원이 있으시면..."이 두 턴 연속으로 똑같이 나갔다.
+# ask_intake의 [주의]와 같은 장치를 둔다.
+_INCOME_STAGE_NOTE = (
+    "위 단계는 '여기까지 물어도 된다'는 상한이지 반드시 그 단계를 물으라는 뜻이 아니다. "
+    "앞 턴에 이미 소득을 물었는데 사용자가 답하지 않았다면 **같은 문장을 반복하지 마라.** "
+    "훨씬 짧게 한 번만 더 권하거나, 답하기 어려워 보이면 소득 이야기는 접고 "
+    "다른 축(아직 안 나온 관심주제·상황)을 물어라."
+)
+
+
+def income_unknown(state: CbState) -> bool:
+    """소득 구간을 아직 못 잡았는가. 다음 단계로 넘어갈지 정한다.
+
+    '모름'은 답이긴 하지만 구간을 잡아주지는 못한다 — user_income_pct도
+    user_income_floor도 None을 돌려줘서 랭킹에 아무것도 싣지 못한다.
+    그래서 '아직 못 잡은' 쪽으로 센다. 다음 단계는 같은 것을 되묻는 게 아니라
+    액수라는 **다른 질문**으로 넘어가는 것이라 심문이 되지 않는다.
+
+    '해당없음'은 다르다. 수급·차상위 어디에도 해당하지 않는다는 것은
+    기준중위소득 50%를 넘는다는 뜻이라 그 자체가 쓸 수 있는 신호다.
+    """
+    if state.get("monthly_income") is not None:
+        return False
+    category = state.get("income_category")
+    return category is None or category == grading.INCOME_CATEGORY_UNSURE
+
+
+# 사용자가 "그만 묻고 찾아달라"고 한 신호. 이 말이 나오면 소득 질문을 접는다.
+#
+# LLM의 ready는 '충분히 들었다'와 '사용자가 그만 물으래'를 구분하지 못한다.
+# 뒤쪽인데 한 턴 더 물으면 신뢰를 잃으므로, 좁은 표현만 골라서 원문으로 막는다.
+# 넓게 잡을 이유가 없다 — 못 걸러도 질문 한 번을 더 하는 것뿐이고,
+# 잘못 걸리면 물어볼 기회를 잃는다.
+_WANTS_RESULTS = re.compile(
+    r"찾아\s*(줘|주세요|주실|봐|봐요)|보여\s*(줘|주세요)|이제\s*(됐|그만)|그만\s*(물어|하고)")
+
+
+def needs_income_probe(state: CbState) -> bool:
+    """검색으로 넘어갈 때가 됐지만 소득을 한 번 더 물어볼 차례인가.
+
+    소득 구간을 알면 결과 정확도가 크게 오른다. 그런데 1단계(앵커 우회질문)는
+    자연스러운 대화 흐름에 얹혀 있어서, 사용자가 "잘 모르겠어요"라고 답하면
+    그대로 검색으로 넘어가 버린다. 실측(2026-07-31)에서 2단계는 한 번도
+    실행되지 않았다 — is_ready가 관심주제와 나이만으로 곧장 true가 된다.
+
+    그래서 여기서만 검색을 미룬다. 미루는 데는 조건이 붙는다:
+
+      - **1단계부터 보장한다.** 관심주제와 나이만으로 곧장 검색으로 가던
+        대화도 소득 우회질문을 최소 한 번은 거친다 (2026-07-31 결정).
+        그 전에는 "생활비가 빠듯해요 → 대상? → 나이? → 검색"처럼 소득을
+        한 번도 안 묻고 끝나는 경로가 있었다.
+      - **상태·등급 질문(ask_narrow)보다 먼저다.** 그쪽은 '마지막 질문'이라고
+        말하고 나가므로, 그 뒤에 또 물으면 한 말을 뒤집는 것이 된다.
+      - **턴 예산 안에서만.** MAX_USER_TURNS를 넘기면서까지 묻지 않는다.
+        상태·등급 질문이 아직 남아 있으면 그 몫으로 한 턴을 비워 둔다.
+      - 사용자가 그만 찾아달라고 했으면 묻지 않는다.
+    """
+    if state.get("narrow_asked") or not income_unknown(state):
+        return False
+    probes = int(state.get("income_probes") or 0)
+    if probes >= MAX_INCOME_PROBES:
+        return False
+    budget = MAX_USER_TURNS - (1 if needs_narrow(state) else 0)
+    if user_turns(state) >= budget:
+        return False
+    return not _WANTS_RESULTS.search(_last_user_text(state))
+
+
 async def converse(state: CbState) -> Dict[str, Any]:
     """아직 정보가 부족할 때의 대화 턴.
 
@@ -601,7 +698,20 @@ async def converse(state: CbState) -> Dict[str, Any]:
     messages = [
         {"role": "system", "content": prompts.load("converse")},
         {"role": "system", "content": _known_block(state)},
-    ] + _history(state)
+    ]
+
+    # 소득이 아직 안 잡혔으면 이번 턴이 몇 단계인지 알려준다. 프롬프트만으로는
+    # LLM이 단계를 세지 못해서 매번 1단계를 되풀이한다.
+    update: Dict[str, Any] = {}
+    probes = int(state.get("income_probes") or 0)
+    if income_unknown(state) and probes < MAX_INCOME_PROBES:
+        stage = probes + 1
+        messages.append({"role": "system", "content": "[소득 파악 단계] %s\n%s" % (
+            _INCOME_STAGE_ASK[stage], _INCOME_STAGE_NOTE)})
+        update["income_probes"] = stage
+        logger.info("[converse] 소득 파악 %d단계", stage)
+
+    messages += _history(state)
 
     try:
         resp = await embedding.with_retry(
@@ -621,7 +731,8 @@ async def converse(state: CbState) -> Dict[str, Any]:
         text = ("어떤 부분이 가장 힘드신가요? "
                 "주거비, 병원비, 일자리처럼 지금 가장 마음에 걸리는 걸 알려주시면 찾아볼게요.")
 
-    return {"answer": text, "asked_followup": True, "phase": "gathering"}
+    update.update({"answer": text, "asked_followup": True, "phase": "gathering"})
+    return update
 
 
 async def search_institutions(state: CbState) -> Dict[str, Any]:
@@ -664,13 +775,19 @@ def _rerank(rows: List[Dict[str, Any]], state: CbState,
     SQL은 태그와 유사도까지만 안다. '누구를 위해 찾는지'와 '사용자가 어떤
     자격을 밝혔는지'는 대화에만 있어서 여기서 반영한다.
     """
+    user_text = " ".join([query_text] + _user_texts(state))
     _apply_target_signal(rows, state.get("target_for"),
                          knows_caree=state.get("caree_age") is not None)
+    # 대화에 나온 질환·상황이 원문에 적힌 제도를 끌어올린다. 아래 eligibility.apply
+    # (질환 감점)와 짝이고 방향만 반대다. 감점보다 먼저 얹어도 결과는 같다 —
+    # 둘 다 곱셈이고, 한 제도가 양쪽에 동시에 걸리는 일은 없다
+    # (disease_penalty는 '대화에 안 나온' 질환에만 붙는다).
+    rows = eligibility.disease_boost(rows, user_text)
     # 자격이 어긋나는 건은 여기서 목록에서 빠진다. 그래서 검색은 최종 노출
     # 건수보다 넉넉히 가져온다 (cards.SEARCH_LIMIT).
     rows = eligibility.apply(
         rows,
-        user_text=" ".join([query_text] + _user_texts(state)),
+        user_text=user_text,
         user_household=state.get("household") or [],
         denied=state.get("denied_conditions") or [],
         conditions=state.get("conditions") or [],

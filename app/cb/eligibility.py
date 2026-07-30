@@ -293,6 +293,92 @@ def disease_penalty(
     return NARROW_DISEASE_FACTOR, ["질환 한정: %s" % ", ".join(unmentioned[:3])]
 
 
+# --- A-5. 언급된 질환·상황과 원문이 일치할 때의 가산 --------------------------------
+# disease_penalty의 반대 방향이다. 저쪽은 "대화에 없는 좁은 질환이 자격으로
+# 걸린 제도"를 내리고, 이쪽은 "대화에 나온 질환이 원문에 실제로 적힌 제도"를
+# 올린다. 지금까지는 후자가 중립(1.0)이라 아무 일도 하지 않았다.
+#
+# 왜 필요한가 (search.py 첫머리의 실측과 같은 문제):
+#   "치매 걸린 부모님 돌봄 지원" 질의에서 임베딩은 '부모님·돌봄·지원'의 어휘
+#   겹침을 '치매'라는 핵심어보다 강하게 본다. 키워드 채널이 그걸 건져 올리지만
+#   구간을 나누는 것은 RRF 순위이고 맞춤 섹션 안 정렬은 distance라, 정작
+#   치매 제도가 맞춤 아래쪽이나 혹시관심으로 밀리는 일이 남는다.
+#
+# **CONDITION_GROUPS와 일부러 분리했다.** 그쪽은 _all_groups()를 거쳐 감점·제외에도
+# 쓰인다. 거기에 항목을 늘리면 그 병을 말하지 않은 사용자에게서 제도가 통째로
+# 사라진다. 이 표는 가산에만 쓰이므로 늘려도 무엇 하나 사라지지 않는다.
+#
+# (사용자가 쓸 표현, 제도 원문에 적힌 표현)으로 나눈 이유는 둘이 다르기 때문이다.
+# 856건 실측(2026-07-31): 사용자가 흔히 쓰는 '뇌졸중·중풍·편마비'는 원문에
+# 0건이고, 같은 상태를 제도는 전부 '뇌병변'(9건)으로 적는다. '알츠하이머'도
+# 0건이고 원문은 '치매'(9건)다. 사용자 말을 그대로 찾으면 한 건도 안 걸린다.
+DISEASE_BOOST_GROUPS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
+    # 오른쪽 괄호 안 숫자는 856건 중 원문(제도명/지원대상/서비스내용) 출현 건수.
+    "치매": (("치매", "인지증", "알츠하이머"), ("치매",)),                      # 9
+    "뇌병변": (("뇌병변", "뇌졸중", "뇌경색", "뇌출혈", "중풍", "편마비", "반신마비"),
+               ("뇌병변",)),                                                # 9
+    "파킨슨": (("파킨슨",), ("파킨슨",)),                                     # 3
+    "암": (("암", "항암", "종양", "백혈병"),
+           ("암환자", "암 환자", "항암", "종양", "백혈병")),                    # 5
+    "희귀·난치": (("희귀질환", "희귀병", "난치"), ("희귀질환", "난치")),          # 17
+    "정신질환": (("정신질환", "조현병", "우울", "조울", "공황", "정신과"),
+                 ("정신질환", "우울")),                                       # 4
+    "발달장애": (("발달장애", "자폐", "지적장애", "경계선지능"),
+                 ("발달장애", "자폐", "지적장애")),                            # 29
+    "당뇨": (("당뇨",), ("당뇨",)),                                          # 7
+    "감염병": (("결핵", "한센", "에이즈", "HIV"), ("결핵", "한센")),            # 6
+    "척수·와상": (("척수", "와상", "거동이 불편", "거동 불편", "사지마비", "전신마비"),
+                  ("척수", "와상", "거동")),                                  # 6
+    "신장": (("투석", "신부전", "콩팥"), ("투석",)),                           # 1
+}
+
+# 가산 배율. 기존 가산(SEVERITY_MATCH_BOOST / INCOME_MATCH_BOOST)과 같은 값이다.
+# 셋 다 "사용자가 밝힌 사실과 제도 원문이 맞아떨어졌다"는 같은 성격이라
+# 한쪽만 세게 줄 이유가 없다.
+DISEASE_MATCH_BOOST = 1.3
+
+
+def disease_boost(rows: List[Dict[str, Any]], user_text: str) -> List[Dict[str, Any]]:
+    """대화에 나온 질환·상황이 원문에 실제로 적힌 제도를 끌어올린다.
+
+    제도명·지원대상·서비스내용 세 곳을 본다. 요청대로 service_content까지
+    보려면 search.py의 SELECT에 그 컬럼이 있어야 한다(없으면 조용히 건너뛴다).
+
+    disease_match 표시를 남긴다. cards.split_sections가 이걸 보고
+      - 거리 컷을 면제하고 (grading_confirmed와 같은 취급)
+      - 맞춤 섹션 안에서 앞자리에 세운다.
+    배율만으로는 부족하다 — 구간을 나누는 것은 RRF 순위인데 맞춤 섹션의
+    정렬은 distance라, 배율로 순위를 올려도 섹션 안에서 다시 뒤로 밀린다.
+
+    정렬은 하지 않는다. 호출부(nodes._rerank)가 모든 신호를 얹은 뒤 한 번만 한다.
+    """
+    haystack = user_text or ""
+    mentioned = {
+        group: inst_terms
+        for group, (user_terms, inst_terms) in DISEASE_BOOST_GROUPS.items()
+        if _contains_any(haystack, user_terms)
+    }
+    if not mentioned:
+        return rows
+
+    boosted = 0
+    for row in rows:
+        body = " ".join(filter(None, [
+            row.get("serv_nm"), row.get("target_detail"), row.get("service_content"),
+        ]))
+        hits = [group for group, inst_terms in mentioned.items()
+                if _contains_any(body, inst_terms)]
+        if not hits:
+            continue
+        row["rrf"] = float(row.get("rrf") or 0.0) * DISEASE_MATCH_BOOST
+        row["disease_match"] = hits
+        boosted += 1
+
+    logger.info("[disease] 대화에 나온 질환=%s → 원문 일치 %d건 가산",
+                ", ".join(sorted(mentioned)), boosted)
+    return rows
+
+
 # --- B. 배타적인 가구상황 태그 -------------------------------------------------
 # '저소득'과 '장애인'은 넣지 않는다.
 #   저소득: 대부분 우선지원 성격이라 누구나 해당될 수 있다.
@@ -348,9 +434,24 @@ def penalty_for(
     reasons: List[str] = []
     from_source = False
 
+    # 사용자가 말한 병을 이 제도가 실제로 다루는가 (disease_boost가 남긴 표시).
+    #
+    # 이게 켜져 있으면 **질환 그룹(CONDITION_GROUPS)으로는 빼지 않는다.**
+    # 의료 제도는 대상 질환을 여러 개 나열하는 일이 흔한데, 그중 하나가
+    # 사용자 것이면 나머지를 말하지 않았다는 이유로 뺄 근거가 없다.
+    # 실측(2026-07-31): "어머니가 치매신데 병원비" 상담에서 「건강보험 산정특례」가
+    # 치매 가산을 받고도 '중증난치'라는 다른 대상 때문에 목록에서 빠졌다.
+    # (disease_penalty의 "하나라도 사용자가 말했으면 이 제도는 대화 안에 있다"와 같은 규칙이다.)
+    #
+    # 신원 기반 그룹(EXCLUSIVE_GROUPS)에는 적용하지 않는다. 「(산재근로자)케어센터지원」이
+    # 서비스내용에 치매를 적었다고 해서 산재근로자가 아닌 사용자가 받을 수 있게 되지는 않는다.
+    covers_mentioned = bool(row.get("disease_match"))
+
     haystack = "%s %s" % (row.get("serv_nm") or "", row.get("target_detail") or "")
     for group, (inst_terms, _) in _all_groups().items():
         if group in claimed:
+            continue
+        if covers_mentioned and group in CONDITION_GROUPS:
             continue
         if _contains_any(haystack, inst_terms):
             factor *= EXCLUSIVE_TERM_FACTOR
