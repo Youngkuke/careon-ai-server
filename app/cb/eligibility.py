@@ -431,6 +431,46 @@ def disease_boost(rows: List[Dict[str, Any]], user_text: str) -> List[Dict[str, 
 # 아니어서(자격 조항일 수도, 배제 조항일 수도 있다) 질환명 일치만큼 강하게 보지 않는다.
 CONDITION_MATCH_BOOST = 1.3
 
+# 자격 조항인가, **배제** 조항인가.
+#
+# 실측(2026-07-31, 페르소나1): 「가사·간병 방문 지원사업」 원문의
+# '노인장기요양보험급여'는 자격이 아니라 배제 조항이다 —
+#   "만 65세 미만의 ... 아래에 해당하는 경우 지원대상에서 제외합니다.
+#    - 만 65세 이상의 어르신
+#    - ... 유사 돌봄서비스를 받고 있는자 * ... 노인장기요양보험급여"
+# 이걸 자격 신호로 읽고 가산하면 정반대로 동작한다. 장기요양등급이 있어서
+# **오히려 못 받는** 제도를 맨 위로 올린 것이다.
+#
+# grading._is_negated와 같은 발상인데 창을 양쪽으로 잡는다. 저쪽은 뒤만 보면
+# 됐지만(카테고리 바로 뒤에 '제외'가 붙는 형태), 배제 목록은 '제외합니다'가
+# 목록보다 앞에 나오고 항목이 여러 줄에 걸친다.
+#
+# '제외'만 찾으면 부족하다. 실측: 「노인맞춤돌봄서비스」는 같은 뜻을
+#   "유사중복사업을 노인맞춤돌봄서비스보다 우선적으로 제공 ① 노인장기요양보험 등급자"
+# 라고 쓴다. 장기요양 등급자는 이 서비스가 아니라 그쪽을 받으라는 말이라
+# 사실상 후순위 배제인데, '제외'라는 낱말은 어디에도 없다.
+_RE_CONDITION_NEGATION = re.compile(
+    r"제외|받고\s*있는\s*자|유사\s*중복|중복\s*(수급|지원|사업|불가)"
+    r"|우선\s*(적으로)?\s*제공|불가|해당하지\s*않|아닌\s*자")
+_CONDITION_NEGATION_WINDOW = 80
+
+
+def _is_disqualifier(body: str, terms: Sequence[str]) -> bool:
+    """이 자격어가 원문에서 '배제' 쪽에만 등장하는가.
+
+    배제 문맥이 아닌 등장이 하나라도 있으면 자격 조항으로 본다. 놓치는 쪽이
+    (가산을 안 하는 쪽이) 정반대로 올리는 쪽보다 안전하다.
+    """
+    seen = False
+    for term in terms:
+        for match in re.finditer(re.escape(term), body):
+            seen = True
+            window = body[max(0, match.start() - _CONDITION_NEGATION_WINDOW):
+                          match.end() + _CONDITION_NEGATION_WINDOW]
+            if not _RE_CONDITION_NEGATION.search(window):
+                return False
+    return seen
+
 
 def condition_boost(rows: List[Dict[str, Any]],
                     conditions: Sequence[str]) -> List[Dict[str, Any]]:
@@ -443,19 +483,28 @@ def condition_boost(rows: List[Dict[str, Any]],
         return rows
 
     boosted = 0
+    skipped = 0
     for row in rows:
+        # 제도명이 사용자가 말하지 않은 질환 전용이면 끌어올리지 않는다.
+        # 「발달장애인 긴급돌봄사업」이 '장애인복지법' 한 낱말로 가산을 받아
+        # 감점(0.7)을 상쇄해 버렸다. 등록장애인인 것은 맞지만 이 제도는
+        # 지적·자폐성 장애 전용이다.
+        if row.get("disease_mismatch"):
+            skipped += 1
+            continue
         body = " ".join(filter(None, [
             row.get("serv_nm"), row.get("target_detail"), row.get("service_content"),
         ]))
-        hits = [name for name, terms in groups.items() if _contains_any(body, terms)]
+        hits = [name for name, terms in groups.items()
+                if _contains_any(body, terms) and not _is_disqualifier(body, terms)]
         if not hits:
             continue
         row["rrf"] = float(row.get("rrf") or 0.0) * CONDITION_MATCH_BOOST
         row["condition_match"] = hits
         boosted += 1
 
-    logger.info("[condition] 확인된 자격=%s → 원문 일치 %d건 가산",
-                ", ".join(sorted(groups)), boosted)
+    logger.info("[condition] 확인된 자격=%s → 가산 %d건 (다른 질환 전용 %d건 건너뜀)",
+                ", ".join(sorted(groups)), boosted, skipped)
     return rows
 
 

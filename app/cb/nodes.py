@@ -616,6 +616,63 @@ _INCOME_STAGE_ASK = {
        "그 밖에 받고 있는 수급. 예/아니오로 닫히지 않게 열린 질문으로 부드럽게 묻는다.",
 }
 
+# 돌봄이 필요한 상태가 확인됐다는 표시. 이 중 하나라도 conditions에 있으면
+# 장애 정도를 소득보다 먼저 확인한다 (2026-07-31 결정).
+#
+# 왜 순서를 바꾸는가: 중증도가 잡히면 eligibility.grading_adjust가 1.3배 가산과
+# 0.7배 감점을 건다. 안 잡히면 그 배율이 **아예 작동하지 않는다.** 반면 소득은
+# 못 잡아도 '모르면 배제하지 않는다'로 안전하게 넘어간다. 손실이 큰 쪽을 먼저 딴다.
+CARE_CONDITIONS = frozenset({"장기요양등급", "장애등록"})
+
+
+def _severity_ask(state: CbState) -> str:
+    """장애 정도를 알아내기 위한 앵커 질문. 무엇이 확인됐는지에 따라 다르게 묻는다.
+
+    **장기요양등급만 확인된 경우에 '몇 급이세요'를 물으면 안 된다.**
+    장애 정도('심한/심하지 않은')는 등록장애인에게만 매겨지는 구분이라,
+    장기요양등급만 있는 어르신에게는 성립하지 않는 질문이다. 그때는 장애 등록
+    자체가 되어 있는지를 지원 이름으로 함께 더듬는다.
+
+    어느 쪽이든 등급·정도를 직접 묻지 않는다. 이용자 상당수가 자기 등급을
+    정확히 모르고, 틀리게 답하면 그 답이 그대로 검색을 왜곡한다
+    (app/cb/prompts/narrow.md의 우회 질문 원칙 그대로다).
+    """
+    who = "돌보시는 분" if state.get("target_for") == constants.TARGET_CAREE else "본인"
+    if "장애등록" in (state.get("conditions") or []):
+        return ("장애 정도 — %s이 지금 받고 계신 장애 관련 지원의 **이름** "
+                "(활동지원서비스, 장애인연금, 장애수당 등). "
+                "'중증이신가요', '몇 급이세요'라고 직접 묻지 마라. "
+                "이름에서 시스템이 정도를 알아낸다." % who)
+    return ("장애 정도 — %s이 장애 등록도 되어 있는지, 그리고 받고 계신 지원의 "
+            "**이름**(장애인연금, 장애수당, 활동지원서비스 등). 등급을 직접 묻지 마라. "
+            "장애 등록이 없으실 수도 있으니 단정하지 말고 부드럽게 확인한다." % who)
+
+
+def needs_severity_probe(state: CbState) -> bool:
+    """장애 정도를 한 번 확인할 차례인가. 소득 단계보다 앞선다.
+
+    돌봄이 필요한 상태(장기요양등급·장애등록)가 이미 확인된 대화에서만 묻는다.
+    그렇지 않은 대화에서는 장애 정도를 물을 근거 자체가 없다.
+
+    실측(2026-07-31, 페르소나1): 사용자가 스스로 "장기요양등급은 받으셨어요"라고
+    말해 needs_narrow가 꺼졌고, ask_narrow가 한 번도 돌지 않아 장애 정도를
+    물을 자리가 사라졌다. 결과적으로 grading_adjust가 통째로 무동작이었다.
+
+    딱 한 번만 묻는다(severity_asked). 등급·정도는 모르는 사람이 많아서
+    되물어봐야 나올 것이 없다.
+    """
+    if state.get("severity_asked") or state.get("narrow_asked"):
+        return False
+    if state.get("disability_severity_hint") is not None:
+        return False
+    if not (CARE_CONDITIONS & set(state.get("conditions") or [])):
+        return False
+    budget = MAX_USER_TURNS - (1 if needs_narrow(state) else 0)
+    if user_turns(state) >= budget:
+        return False
+    return not _WANTS_RESULTS.search(_last_user_text(state))
+
+
 def _last_bot_text(state: CbState) -> str:
     """직전에 봇이 한 말. 같은 문장을 두 번 쓰지 않게 하려고 쓴다."""
     for message in reversed(state.get("messages") or []):
@@ -639,8 +696,8 @@ _DECLINES = re.compile(
     r"|그냥\s*넘어|넘어갈게|패스할|비밀")
 
 
-def converse_focus(state: CbState) -> Tuple[str, Optional[int]]:
-    """이번 turn에 무엇을 물을지 **코드가** 정한다. (지시문, 소득 단계)
+def converse_focus(state: CbState) -> Tuple[str, Dict[str, Any]]:
+    """이번 turn에 무엇을 물을지 **코드가** 정한다. (지시문, State 갱신분)
 
     전에는 converse만 초점 없이 돌았다. ask_intake와 ask_narrow는 '이번 턴에
     확인할 것'을 코드가 계산해서 넘겨주는데, converse는 프롬프트가 매 턴
@@ -654,12 +711,19 @@ def converse_focus(state: CbState) -> Tuple[str, Optional[int]]:
 
     그래서 순서를 코드로 못 박는다. **이미 채워진 슬롯은 건너뛴다.**
       1. 관심주제가 비었다 → 무엇이 가장 부담되는지 (이때만 묻는다)
-      2. 소득 구간을 아직 못 잡았다 → 1·2·3단계 중 이번 차례
-      3. 둘 다 됐다 → 짧게 마무리
+      2. 돌봄 상태가 확인됐는데 장애 정도를 모른다 → 앵커 질문으로 정도 확인
+      3. 소득 구간을 아직 못 잡았다 → 1·2·3단계 중 이번 차례
+      4. 다 됐다 → 짧게 마무리
+
+    2가 3보다 앞이다. 중증도가 없으면 grading_adjust의 배율이 아예 작동하지
+    않는데, 소득은 못 잡아도 '모르면 배제하지 않는다'로 넘어간다.
     """
     if not (state.get("theme") or []):
         return ("지금 가장 부담되는 것이 무엇인지. 분야를 일상어로 예를 들어라 "
-                "('월세나 집 문제', '병원비'처럼)."), None
+                "('월세나 집 문제', '병원비'처럼)."), {}
+
+    if needs_severity_probe(state):
+        return _severity_ask(state), {"severity_asked": True}
 
     probes = int(state.get("income_probes") or 0)
     wrap_up = ("그 외에 더 걸리는 것이 있는지 짧게 확인하고 마무리한다. "
@@ -675,13 +739,13 @@ def converse_focus(state: CbState) -> Tuple[str, Optional[int]]:
     if probes >= 1 and _DECLINES.search(_last_user_text(state)):
         logger.info("[converse] 사용자가 소득 이야기를 접었다 — 더 묻지 않는다")
         return ("소득 이야기는 접는다. 다시 묻지 말고, 짧게 받아준 뒤 %s" % wrap_up,
-                MAX_INCOME_PROBES)
+                {"income_probes": MAX_INCOME_PROBES})
 
     if income_unknown(state) and probes < MAX_INCOME_PROBES:
         stage = probes + 1
-        return _INCOME_STAGE_ASK[stage], stage
+        return _INCOME_STAGE_ASK[stage], {"income_probes": stage}
 
-    return wrap_up, None
+    return wrap_up, {}
 
 
 # 단계는 상한이지 지시가 아니다. 사용자가 답하지 않고 다른 이야기를 해도
@@ -765,12 +829,9 @@ async def converse(state: CbState) -> Dict[str, Any]:
     ]
 
     # 이번 턴의 초점은 코드가 정한다 (ask_intake·ask_narrow와 같은 방식).
-    update: Dict[str, Any] = {}
-    focus, stage = converse_focus(state)
+    focus, update = converse_focus(state)
     messages.append({"role": "system", "content":
                      "[이번 턴에 확인할 것] %s\n%s" % (focus, _CONVERSE_NOTE)})
-    if stage is not None:
-        update["income_probes"] = stage
 
     # 직전에 한 말을 그대로 보여주고 반복을 막는다. 대화 이력에 이미 들어 있지만
     # 이력 속의 한 줄로는 힘이 약하다 — 실측에서 자기가 방금 한 질문을 그대로
@@ -781,8 +842,8 @@ async def converse(state: CbState) -> Dict[str, Any]:
                          "[직전에 네가 한 말] %s\n"
                          "이 문장을 다시 쓰지 마라. 같은 것을 또 묻지 마라." % previous})
 
-    logger.info("[converse] 초점=%s%s", focus[:30],
-                " (소득 %d단계)" % stage if stage else "")
+    logger.info("[converse] 초점=%s%s", focus[:34],
+                " %s" % update if update else "")
     messages += _history(state)
 
     try:

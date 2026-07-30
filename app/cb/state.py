@@ -51,6 +51,10 @@ class CbState(TypedDict, total=False):
     # 3단계(가구 안팎의 소득)로 넘어갈지 정하고, 동시에 상한이 된다.
     # 이 값이 없으면 소득 질문이 대화를 끝없이 늘린다.
     income_probes: int
+    # 장애 정도를 물어봤는가. 돌봄 상태(장기요양등급·장애등록)가 확인된
+    # 대화에서 소득보다 **먼저** 딱 한 번 묻는다. 등급을 모르는 사람이 많아서
+    # 되물어봐야 나올 것이 없다.
+    severity_asked: bool
 
     # --- 자격 축: 장애 정도와 소득 구간 -----------------------------------------
     # conditions('장애등록이 있다/없다')와 **별개 축**이다. 있다/없다와 정도를
@@ -145,7 +149,7 @@ def initial_state(user_id: int, region_sgg: Optional[str] = None) -> CbState:
         messages=[],
         life_cycle=[], household=[], theme=[],
         conditions=[], denied_conditions=[], narrow_asked=False,
-        income_probes=0,
+        income_probes=0, severity_asked=False,
         income_category=None, disability_severity_hint=None,
         monthly_income=None, household_size=None,
         region_sgg=region_sgg,
