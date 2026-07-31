@@ -181,9 +181,13 @@ def _known_block(state: CbState) -> str:
         "관심주제: %s" % (", ".join(filters["theme"]) or "(없음)"),
         "  └ 본인 몫으로 나온 주제: %s" % (", ".join(state.get("self_themes") or []) or "(아직 모름)"),
         "  └ 돌보는 분 몫으로 나온 주제: %s" % (", ".join(state.get("caree_themes") or []) or "(아직 모름)"),
-        # 어디가 어떻게 불편하신지. 대화에서 상태 표현이 잡혔으면 그 이름을 보여준다.
-        # 안 보여주면 이미 말한 것을 또 묻는다.
-        "확인된 몸 상태: %s" % (", ".join(sorted(
+        # 어디가 어떻게 불편하신지. 안 보여주면 이미 말한 것을 또 묻는다.
+        #
+        # **내부 분류명이라고 밝혀둔다.** 실측(2026-08-01): 이 줄을 그대로 읽어서
+        # "지체·보행에 어려움이 있으시군요"라고 답한 턴이 나왔다. 사용자가 들을
+        # 말이 아니라 검색이 쓰는 이름이다.
+        "확인된 몸 상태(내부 분류. 이 이름을 사용자에게 그대로 말하지 마라): %s"
+        % (", ".join(sorted(
             eligibility.mentioned_disease_groups(" ".join(_user_texts(state)))))
             or "(아직 모름)"),
         "해당한다고 밝힌 자격: %s" % (", ".join(state.get("conditions") or []) or "(없음)"),
@@ -838,6 +842,33 @@ def _recent_bot_openings(state: CbState, limit: int = _OPENING_HISTORY) -> List[
     return out
 
 
+def _unnamed_disease_note(state: CbState) -> Optional[Dict[str, str]]:
+    """사용자가 증상만 설명하고 병명은 말하지 않았을 때, 봇이 병명을 붙이지 못하게 한다.
+
+    실측(2026-08-01): "기억이 자꾸 흐려지시고 저를 못 알아보실 때가 있어요"에
+    "치매로 인해 기억이 흐려지신다고 하셨군요"라고 답했다. 사용자는 치매라는
+    말을 꺼낸 적이 없다. 진단을 받은 적도 없는데 상담자에게 진단명을 들은 것이
+    되고, 이 서비스는 진단을 하지 않는다.
+
+    검색은 그 추론을 그대로 쓴다(disease_boost). 막는 것은 **입 밖에 내는 것**뿐이다.
+    """
+    said = " ".join(_user_texts(state))
+    unnamed = sorted(
+        name
+        for group, inst_terms in eligibility.mentioned_disease_groups(said).items()
+        for name in inst_terms
+        if name not in said
+    )
+    if not unnamed:
+        return None
+    return {"role": "system", "content":
+            "[주의] 사용자는 병명을 말한 적이 없다. 증상만 설명했다. "
+            "다음 말을 네 답변에 쓰지 마라: %s. "
+            "사용자가 쓴 표현을 그대로 받아라('기억이 흐려지신다고 하셨는데'). "
+            "너는 의료인이 아니고 이 서비스는 진단을 하지 않는다."
+            % ", ".join(unnamed)}
+
+
 def _opening_note(openings: List[str]) -> Optional[Dict[str, str]]:
     """이미 써먹은 첫마디를 알려주고 되풀이를 막는 system 메시지.
 
@@ -1120,6 +1151,9 @@ async def converse(state: CbState) -> Dict[str, Any]:
     opening_note = _opening_note(openings)
     if opening_note:
         messages.append(opening_note)
+    disease_note = _unnamed_disease_note(state)
+    if disease_note:
+        messages.append(disease_note)
 
     logger.info("[converse] 초점=%s%s", focus[:34],
                 " %s" % update if update else "")
