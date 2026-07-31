@@ -39,6 +39,16 @@ _INTENT_SCHEMA = {
             "type": "array",
             "items": {"type": "string", "enum": constants.THEME_TAGS},
         },
+        # 같은 주제가 누구 몫으로 나온 것인지. theme의 부분집합이고, 어느 쪽인지
+        # 불분명하면 양쪽 다 비운다 (그러면 지금까지와 똑같이 동작한다).
+        "self_themes": {
+            "type": "array",
+            "items": {"type": "string", "enum": constants.THEME_TAGS},
+        },
+        "caree_themes": {
+            "type": "array",
+            "items": {"type": "string", "enum": constants.THEME_TAGS},
+        },
         # 상태·등급. 해당한다고 밝힌 것과, 아니라고 밝힌 것을 나눠서 받는다.
         # 답하지 않은 것은 어느 쪽에도 넣지 않는다 (모름 ≠ 해당 없음).
         "conditions": {
@@ -82,6 +92,7 @@ _INTENT_SCHEMA = {
         "target_for_evidence": {"type": "string"},
     },
     "required": ["life_cycle", "household", "theme",
+                 "self_themes", "caree_themes",
                  "conditions", "denied_conditions", "query_text", "ready",
                  "age", "caree_age", "target_for", "target_for_evidence",
                  "income_category", "income_category_evidence",
@@ -148,6 +159,13 @@ def _known_block(state: CbState) -> str:
         "생애주기: %s" % (", ".join(filters["life_cycle"]) or "(없음)"),
         "가구상황: %s" % (", ".join(filters["household"]) or "(없음)"),
         "관심주제: %s" % (", ".join(filters["theme"]) or "(없음)"),
+        "  └ 본인 몫으로 나온 주제: %s" % (", ".join(state.get("self_themes") or []) or "(아직 모름)"),
+        "  └ 돌보는 분 몫으로 나온 주제: %s" % (", ".join(state.get("caree_themes") or []) or "(아직 모름)"),
+        # 어디가 어떻게 불편하신지. 대화에서 상태 표현이 잡혔으면 그 이름을 보여준다.
+        # 안 보여주면 이미 말한 것을 또 묻는다.
+        "확인된 몸 상태: %s" % (", ".join(sorted(
+            eligibility.mentioned_disease_groups(" ".join(_user_texts(state)))))
+            or "(아직 모름)"),
         "해당한다고 밝힌 자격: %s" % (", ".join(state.get("conditions") or []) or "(없음)"),
         "해당 없다고 밝힌 자격: %s" % (", ".join(state.get("denied_conditions") or []) or "(없음)"),
         "받고 있는 급여 구분: %s" % (state.get("income_category") or "(아직 모름)"),
@@ -210,6 +228,14 @@ async def extract_intent(state: CbState) -> Dict[str, Any]:
         kind: constants.filter_to_vocabulary(raw.get(kind) or [], kind)
         for kind in ("life_cycle", "household", "theme")
     }
+    # 주제의 축 귀속. 어휘는 theme과 같은 것을 쓴다.
+    # 한 턴에 양쪽으로 동시에 온 값은 둘 다 버린다 — LLM이 가르지 못한 것이고,
+    # 잘못 귀속시키면 멀쩡한 제도가 내려가는데 안 넣으면 종전과 같이 동작할 뿐이다.
+    axis = {kind: constants.filter_to_vocabulary(raw.get(kind) or [], "theme")
+            for kind in ("self_themes", "caree_themes")}
+    ambiguous = set(axis["self_themes"]) & set(axis["caree_themes"])
+    for kind, values in axis.items():
+        update[kind] = [v for v in values if v not in ambiguous]
     for kind in ("conditions", "denied_conditions"):
         update[kind] = [v for v in (raw.get(kind) or [])
                         if v in constants.CONDITION_TAGS]
@@ -277,13 +303,15 @@ async def extract_intent(state: CbState) -> Dict[str, Any]:
     if bands:
         update["life_cycle"] = merge_tags(update.get("life_cycle"), bands)
 
-    logger.info("[intent] 신규태그=%s query=%r ready=%s age=%s 돌봄대상연세=%s 대상=%s",
+    logger.info("[intent] 신규태그=%s query=%r ready=%s age=%s 돌봄대상연세=%s 대상=%s 축=%s",
                 {k: v for k, v in update.items()
                  if k in ("life_cycle", "household", "theme") and v},
                 update["query_text"][:40], update["ready"],
                 update.get("age", state.get("age")),
                 update.get("caree_age", state.get("caree_age")),
-                effective_target or "미상")
+                effective_target or "미상",
+                {k: v for k, v in update.items()
+                 if k in ("self_themes", "caree_themes") and v} or "미상")
     return update
 
 
@@ -625,6 +653,67 @@ _INCOME_STAGE_ASK = {
 CARE_CONDITIONS = frozenset({"장기요양등급", "장애등록"})
 
 
+def _condition_ask(state: CbState) -> str:
+    """어디가 어떻게 불편하신지. 검색 이전 단계에서 가장 값이 큰 한 턴이다.
+
+    **이분법으로 묻지 않는다.** "신체적 장애세요, 정신적 장애세요?"는 답할 수
+    있는 사람이 드물고, 답을 받아도 856건을 가르지 못한다 — 제도 원문은 그런
+    상위 분류로 자격을 적지 않는다.
+
+    대신 데이터에 실제로 있는 표현의 축으로 예를 든다. 856건 실측(2026-07-31):
+      거동·보행  '휠체어' 12건 / '보행' 4건 / '지체장애' 4건 / '거동' 4건
+      인지       '인지' 28건 / '치매' 10건
+      정신       '정신' 40건 / '우울' 4건
+      감각       '시각장애' 8건 / '청각장애' 6건 / '보청기' 5건
+      치료 중인 병 '재활' 32건 / '희귀' 28건 / '난치' 25건 / '암' 18건
+    이 축으로 답이 오면 eligibility.DISEASE_BOOST_GROUPS가 그대로 받아
+    해당 제도를 맞춤 상단으로 올린다. 축을 벗어난 답도 손해는 없다 —
+    query_text에 실려 검색어가 된다.
+    """
+    who = "돌보시는 분" if state.get("target_for") == constants.TARGET_CAREE else "본인"
+    return (
+        "어디가 어떻게 불편하신지 — %s의 몸 상태를 구체적으로 확인한다. "
+        "일상에서 무엇이 어려운지를 묻고, 답하기 쉽게 예를 두세 개 곁들여라. "
+        "예로 들 만한 것: 걷거나 움직이는 것이 힘드신지, 기억이나 판단이 예전 같지 "
+        "않으신지, 눈이나 귀가 불편하신지, 계속 치료받고 계신 병이 있으신지. "
+        "**'신체적 장애세요, 정신적 장애세요' 같은 이분법으로 묻지 마라** — "
+        "답할 수 있는 사람이 드물고 그 답으로는 제도를 가를 수 없다. "
+        "고르라고 하지 말고 열린 질문으로 묻고, 진단명을 모르셔도 괜찮다고 덧붙여라."
+        % who
+    )
+
+
+def needs_condition_probe(state: CbState) -> bool:
+    """어디가 어떻게 불편하신지를 한 번 물어볼 차례인가. 다른 어떤 질문보다 앞선다.
+
+    실측(2026-07-31, 26세 사용자 / 81세 할아버지): "돌봄이랑 병원비인 것 같아"까지
+    듣고 곧장 매칭으로 넘어갔다. 실제로는 지체장애·낙상 후유증이었는데 아무도
+    묻지 않아서, 제도의 서비스 내용과 대조할 상태 정보가 슬롯에 없었다.
+    그 결과 eligibility.disease_boost가 통째로 무동작이 됐고(대화에 질환어가
+    하나도 없으면 가산도 감점도 하지 않는다), 노인 돌봄군이 주제 태그만으로
+    뭉텅이로 올라왔다.
+
+    이미 상태가 드러난 대화에서는 묻지 않는다. 판정은 순위에 실제로 쓰이는
+    표('DISEASE_BOOST_GROUPS')로 한다 — 그 표에 걸리는 말이 나왔다면 순위가
+    이미 움직인다는 뜻이고, 걸리지 않았다면 사용자가 무슨 말을 했든 검색에는
+    아직 아무것도 실리지 않았다는 뜻이다.
+
+    소득·등급보다 먼저다. 등급과 소득은 못 잡아도 '모르면 배제하지 않는다'로
+    넘어가지만, 상태를 모르면 무엇을 찾아야 하는지 자체가 정해지지 않는다.
+    """
+    if state.get("condition_asked") or state.get("narrow_asked"):
+        return False
+    # 몸 상태를 물을 근거가 있는 주제인가. 상태·등급 질문과 같은 기준을 쓴다.
+    if not (NARROW_THEMES & set(state.get("theme") or [])):
+        return False
+    if eligibility.mentioned_disease_groups(" ".join(_user_texts(state))):
+        return False
+    budget = MAX_USER_TURNS - (1 if needs_narrow(state) else 0)
+    if user_turns(state) >= budget:
+        return False
+    return not _WANTS_RESULTS.search(_last_user_text(state))
+
+
 def _severity_ask(state: CbState) -> str:
     """장애 정도를 알아내기 위한 앵커 질문. 무엇이 확인됐는지에 따라 다르게 묻는다.
 
@@ -711,16 +800,24 @@ def converse_focus(state: CbState) -> Tuple[str, Dict[str, Any]]:
 
     그래서 순서를 코드로 못 박는다. **이미 채워진 슬롯은 건너뛴다.**
       1. 관심주제가 비었다 → 무엇이 가장 부담되는지 (이때만 묻는다)
-      2. 돌봄 상태가 확인됐는데 장애 정도를 모른다 → 앵커 질문으로 정도 확인
-      3. 소득 구간을 아직 못 잡았다 → 1·2·3단계 중 이번 차례
-      4. 다 됐다 → 짧게 마무리
+      2. 의료·돌봄 주제인데 몸 상태를 모른다 → 어디가 어떻게 불편하신지
+      3. 돌봄 상태가 확인됐는데 장애 정도를 모른다 → 앵커 질문으로 정도 확인
+      4. 소득 구간을 아직 못 잡았다 → 1·2·3단계 중 이번 차례
+      5. 다 됐다 → 짧게 마무리
 
-    2가 3보다 앞이다. 중증도가 없으면 grading_adjust의 배율이 아예 작동하지
+    2가 맨 앞인 이유는 나머지 전부가 그 답에 얹히기 때문이다. 상태를 모르면
+    질환 가산(disease_boost)이 통째로 무동작이고, 등급 질문도 무엇을 물어야
+    할지 정해지지 않는다.
+
+    3이 4보다 앞이다. 중증도가 없으면 grading_adjust의 배율이 아예 작동하지
     않는데, 소득은 못 잡아도 '모르면 배제하지 않는다'로 넘어간다.
     """
     if not (state.get("theme") or []):
         return ("지금 가장 부담되는 것이 무엇인지. 분야를 일상어로 예를 들어라 "
                 "('월세나 집 문제', '병원비'처럼)."), {}
+
+    if needs_condition_probe(state):
+        return _condition_ask(state), {"condition_asked": True}
 
     if needs_severity_probe(state):
         return _severity_ask(state), {"severity_asked": True}
@@ -919,6 +1016,12 @@ def _rerank(rows: List[Dict[str, Any]], state: CbState,
     # ask_narrow가 마지막 한 턴을 써서 받아낸 답이다. 추정이 아니라 명시적
     # 답변이라 가장 확실한 신호인데, 지금까지 순위에 쓰이지 않고 있었다.
     rows = eligibility.condition_boost(rows, state.get("conditions") or [])
+    # 본인 몫 주제로만 걸린 등록장애인 전용 제도를 내린다. 돌보는 분을 위해
+    # 찾는 대화에서만 돈다 — 본인이 곧 등록장애인인 대화에서는 그 제도들이
+    # 정확히 사용자 것이다.
+    if state.get("target_for") == constants.TARGET_CAREE:
+        rows = eligibility.axis_adjust(
+            rows, state.get("self_themes") or [], state.get("caree_themes") or [])
     # 자격이 어긋나는 건은 여기서 목록에서 빠진다. 그래서 검색은 최종 노출
     # 건수보다 넉넉히 가져온다 (cards.SEARCH_LIMIT).
     rows = eligibility.apply(

@@ -330,6 +330,20 @@ DISEASE_BOOST_GROUPS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
     "척수·와상": (("척수", "와상", "거동이 불편", "거동 불편", "사지마비", "전신마비"),
                   ("척수", "와상", "거동")),                                  # 6
     "신장": (("투석", "신부전", "콩팥"), ("투석",)),                           # 1
+    # 아래 셋은 증상 확인 노드(nodes.needs_condition_probe)를 넣으면서 함께 열었다.
+    # 그 질문의 답으로 가장 많이 돌아올 표현인데, 받아놓고 쓸 데가 없으면
+    # 한 턴을 더 쓴 값이 순위에 아무것도 싣지 못한다.
+    #
+    # 856건 실측(2026-07-31): 원문은 '지체장애'(4) '휠체어'(12) '보행'(4) '목발'(1)로
+    # 적는다. '보행'이 「저소득 노인 보행보조차 지원」「어르신 보행기 지원」을
+    # 끌어오는데, 낙상·거동 어르신 상담에서 정확히 필요한 제도들이다.
+    "지체·보행": (("지체장애", "다리가 불편", "다리를 다치", "걷기 힘드", "걷지 못",
+                  "휠체어", "목발", "골절", "낙상", "넘어지"),
+                  ("지체장애", "휠체어", "보행", "목발")),                     # 18
+    "시각": (("시각장애", "눈이 안 보", "앞이 안 보", "실명", "저시력"),
+             ("시각장애",)),                                                 # 8
+    "청각": (("청각장애", "귀가 안 들", "잘 안 들리", "난청", "보청기"),
+             ("청각장애", "난청", "보청기")),                                 # 11
 }
 
 # 가산 배율. 기존 가산(SEVERITY_MATCH_BOOST / INCOME_MATCH_BOOST)과 같은 값이다.
@@ -505,6 +519,84 @@ def condition_boost(rows: List[Dict[str, Any]],
 
     logger.info("[condition] 확인된 자격=%s → 가산 %d건 (다른 질환 전용 %d건 건너뜀)",
                 ", ".join(sorted(groups)), boosted, skipped)
+    return rows
+
+
+# --- A-7. 본인 축과 돌봄 대상 축이 뒤섞인 제도 --------------------------------------
+# 실측(2026-07-31, 26세 사용자 / 81세 할아버지 상담): "저도 일자리가 빠듯하다"는
+# **본인** 발화에 「장애인일자리지원」이 결과에 섞여 나왔다. 이 제도의 지원대상은
+# "18세 이상 「장애인복지법」상 등록된 미취업 장애인"이다.
+#
+# 어디에도 막을 자리가 없었다:
+#   - 3종 필터는 겹치면 통과(&&)라 theme=[일자리]만으로 들어온다.
+#   - 생애주기는 [중장년, 청년, 노년]이라 _apply_target_signal이 안 건드린다.
+#   - 가구상황 '장애인'은 EXCLUSIVE_HOUSEHOLD에서 **일부러 뺀 값**이다
+#     (돌보는 분이 장애인인 경우가 이 서비스의 핵심 사용자라서).
+#   - 지원대상의 '장애인복지법'은 DENIABLE_GROUPS라 사용자가 명시적으로
+#     "아니다"라고 답했을 때만 걸린다. 이 대화에선 물어본 적이 없다.
+#   - 제도명에 '일자리'가 박혀 있어서 키워드 채널이 오히려 강하게 밀어올린다.
+#
+# 그래서 축을 본다. 사용자가 **본인 몫으로만** 꺼낸 주제로 걸렸는데, 그 제도가
+# 등록장애인을 자격으로 걸고 있으면 본인 축과 돌봄 대상 축을 곱한 것이다.
+#
+# **EXCLUSIVE_HOUSEHOLD에서 '장애인'을 뺀 판단을 뒤집지 않는다.** 그 판단의 근거는
+# "돌보는 분이 장애인인 경우가 핵심 사용자"인데, 그런 제도는 돌봄 축 주제
+# (보호·돌봄, 신체건강 등)로 걸리므로 여기서 손대지 않는다. 이 감점은 돌봄 축
+# 주제가 하나도 안 걸린 제도에만 닿는다.
+AXIS_MISMATCH_FACTOR = 0.7
+
+
+def _is_disability_gated(row: Dict[str, Any]) -> bool:
+    """제도명이 장애인을 내걸고, 지원대상 원문도 등록을 자격으로 거는가.
+
+    **가구상황 태그로 판정하지 않는다.** 태그는 72%가 LLM이 붙인 것인 데다,
+    '장애인' 태그는 취약계층을 두루 열거하는 제도에도 붙는다 — 856건 실측에서
+    「국민임대주택공급」「에너지바우처」「TV수신료 면제」가 그렇다. 태그로 걸면
+    청년 주거 상담에서 국민임대주택이 사라진다.
+
+    제도명 조건을 함께 요구하는 것이 핵심이다. 제도명에 '장애'가 박혀 있다는
+    것은 그게 이 제도의 정체라는 뜻이지 곁다리 대상이 아니다
+    (_names_the_disease가 쓰는 것과 같은 판단이다).
+    """
+    serv_nm = row.get("serv_nm") or ""
+    if "장애" not in serv_nm:
+        return False
+    body = "%s %s" % (serv_nm, row.get("target_detail") or "")
+    return _contains_any(body, DENIABLE_GROUPS["장애등록"])
+
+
+def axis_adjust(rows: List[Dict[str, Any]],
+                self_themes: Sequence[str],
+                caree_themes: Sequence[str]) -> List[Dict[str, Any]]:
+    """본인 몫 주제로만 걸린 등록장애인 전용 제도를 뒤로 민다.
+
+    돌보는 분을 위해 찾는 대화에서만 호출한다(nodes._rerank). 본인이 곧
+    등록장애인인 대화에서는 이 제도들이 정확히 사용자 것이다.
+
+    양쪽에 다 나온 주제는 어느 쪽으로도 세지 않는다. "일자리"가 본인 이야기로도
+    돌보는 분 이야기로도 나왔다면 그건 가려낼 수 있는 신호가 아니다.
+
+    정렬은 하지 않는다. 호출부가 모든 신호를 얹은 뒤 한 번만 한다.
+    """
+    mine = set(self_themes or ()) - set(caree_themes or ())
+    theirs = set(caree_themes or ()) - set(self_themes or ())
+    if not mine:
+        return rows
+
+    demoted: List[str] = []
+    for row in rows:
+        themes = set(row.get("theme_tags") or [])
+        # 본인 몫 주제로 걸리지 않았거나, 돌봄 축 주제에도 함께 걸렸으면 손대지 않는다.
+        if not (themes & mine) or (themes & theirs):
+            continue
+        if not _is_disability_gated(row):
+            continue
+        row["rrf"] = float(row.get("rrf") or 0.0) * AXIS_MISMATCH_FACTOR
+        row["axis_mismatch"] = sorted(themes & mine)
+        demoted.append(row.get("serv_nm") or row.get("serv_id") or "")
+
+    logger.info("[axis] 본인 몫 주제=%s → 등록장애인 전용 %d건 감점 %s",
+                ", ".join(sorted(mine)), len(demoted), demoted[:5])
     return rows
 
 
