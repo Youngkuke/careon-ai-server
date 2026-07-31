@@ -20,29 +20,9 @@ logger = logging.getLogger(__name__)
 
 KST = timezone(timedelta(hours=9))
 
-# 대화 이력을 몇 **메시지**까지 프롬프트에 넣을지.
+# 대화 이력을 몇 턴까지 프롬프트에 넣을지.
 # 전부 넣으면 토큰이 계속 늘고, 오래된 화제가 query_text를 흐린다.
-#
-# 8 → 16 (2026-08-01). 봇의 발화도 messages에 남기기 시작하면서(_spoken) 한 턴이
-# 메시지 두 개가 됐다. 그대로 두면 프롬프트가 보는 대화가 절반으로 줄어든다.
-HISTORY_TURNS = 16
-
-
-def _spoken(text: str) -> List[Any]:
-    """봇이 한 말을 대화 이력에 남긴다.
-
-    **지금까지 남기지 않고 있었다.** greet만 messages에 AIMessage를 넣고
-    ask_intake·ask_narrow·converse·wrap_up은 answer만 돌려줬다. 그래서
-    프롬프트에 들어가는 대화 이력(_history)에 사용자 발화만 있었고,
-    _last_bot_text는 언제나 첫 인사만 돌려줬다 — '[직전에 네가 한 말]을 다시 쓰지
-    마라'는 가드가 인사말과 비교하고 있었으니 아무것도 막지 못했다.
-
-    이것이 같은 질문·같은 첫마디가 되풀이된 근본 원인이다. 봇은 자기가 방금
-    무슨 말을 했는지 볼 수 없는 상태로 매 턴 문장을 새로 지어냈다.
-    """
-    from langchain_core.messages import AIMessage
-
-    return [AIMessage(content=text)]
+HISTORY_TURNS = 8
 
 _INTENT_SCHEMA = {
     "type": "object",
@@ -56,16 +36,6 @@ _INTENT_SCHEMA = {
             "items": {"type": "string", "enum": constants.HOUSEHOLD_TAGS},
         },
         "theme": {
-            "type": "array",
-            "items": {"type": "string", "enum": constants.THEME_TAGS},
-        },
-        # 같은 주제가 누구 몫으로 나온 것인지. theme의 부분집합이고, 어느 쪽인지
-        # 불분명하면 양쪽 다 비운다 (그러면 지금까지와 똑같이 동작한다).
-        "self_themes": {
-            "type": "array",
-            "items": {"type": "string", "enum": constants.THEME_TAGS},
-        },
-        "caree_themes": {
             "type": "array",
             "items": {"type": "string", "enum": constants.THEME_TAGS},
         },
@@ -112,7 +82,6 @@ _INTENT_SCHEMA = {
         "target_for_evidence": {"type": "string"},
     },
     "required": ["life_cycle", "household", "theme",
-                 "self_themes", "caree_themes",
                  "conditions", "denied_conditions", "query_text", "ready",
                  "age", "caree_age", "target_for", "target_for_evidence",
                  "income_category", "income_category_evidence",
@@ -179,17 +148,6 @@ def _known_block(state: CbState) -> str:
         "생애주기: %s" % (", ".join(filters["life_cycle"]) or "(없음)"),
         "가구상황: %s" % (", ".join(filters["household"]) or "(없음)"),
         "관심주제: %s" % (", ".join(filters["theme"]) or "(없음)"),
-        "  └ 본인 몫으로 나온 주제: %s" % (", ".join(state.get("self_themes") or []) or "(아직 모름)"),
-        "  └ 돌보는 분 몫으로 나온 주제: %s" % (", ".join(state.get("caree_themes") or []) or "(아직 모름)"),
-        # 어디가 어떻게 불편하신지. 안 보여주면 이미 말한 것을 또 묻는다.
-        #
-        # **내부 분류명이라고 밝혀둔다.** 실측(2026-08-01): 이 줄을 그대로 읽어서
-        # "지체·보행에 어려움이 있으시군요"라고 답한 턴이 나왔다. 사용자가 들을
-        # 말이 아니라 검색이 쓰는 이름이다.
-        "확인된 몸 상태(내부 분류. 이 이름을 사용자에게 그대로 말하지 마라): %s"
-        % (", ".join(sorted(
-            eligibility.mentioned_disease_groups(" ".join(_user_texts(state)))))
-            or "(아직 모름)"),
         "해당한다고 밝힌 자격: %s" % (", ".join(state.get("conditions") or []) or "(없음)"),
         "해당 없다고 밝힌 자격: %s" % (", ".join(state.get("denied_conditions") or []) or "(없음)"),
         "받고 있는 급여 구분: %s" % (state.get("income_category") or "(아직 모름)"),
@@ -252,14 +210,6 @@ async def extract_intent(state: CbState) -> Dict[str, Any]:
         kind: constants.filter_to_vocabulary(raw.get(kind) or [], kind)
         for kind in ("life_cycle", "household", "theme")
     }
-    # 주제의 축 귀속. 어휘는 theme과 같은 것을 쓴다.
-    # 한 턴에 양쪽으로 동시에 온 값은 둘 다 버린다 — LLM이 가르지 못한 것이고,
-    # 잘못 귀속시키면 멀쩡한 제도가 내려가는데 안 넣으면 종전과 같이 동작할 뿐이다.
-    axis = {kind: constants.filter_to_vocabulary(raw.get(kind) or [], "theme")
-            for kind in ("self_themes", "caree_themes")}
-    ambiguous = set(axis["self_themes"]) & set(axis["caree_themes"])
-    for kind, values in axis.items():
-        update[kind] = [v for v in values if v not in ambiguous]
     for kind in ("conditions", "denied_conditions"):
         update[kind] = [v for v in (raw.get(kind) or [])
                         if v in constants.CONDITION_TAGS]
@@ -327,15 +277,13 @@ async def extract_intent(state: CbState) -> Dict[str, Any]:
     if bands:
         update["life_cycle"] = merge_tags(update.get("life_cycle"), bands)
 
-    logger.info("[intent] 신규태그=%s query=%r ready=%s age=%s 돌봄대상연세=%s 대상=%s 축=%s",
+    logger.info("[intent] 신규태그=%s query=%r ready=%s age=%s 돌봄대상연세=%s 대상=%s",
                 {k: v for k, v in update.items()
                  if k in ("life_cycle", "household", "theme") and v},
                 update["query_text"][:40], update["ready"],
                 update.get("age", state.get("age")),
                 update.get("caree_age", state.get("caree_age")),
-                effective_target or "미상",
-                {k: v for k, v in update.items()
-                 if k in ("self_themes", "caree_themes") and v} or "미상")
+                effective_target or "미상")
     return update
 
 
@@ -517,12 +465,6 @@ async def ask_intake(state: CbState) -> Dict[str, Any]:
         messages.append({"role": "system", "content":
                          "[주의] 이미 한 번 물었다. 앞의 문장을 반복하지 말고 "
                          "훨씬 짧게 한 번만 더 권한 뒤, 몰라도 괜찮다고 덧붙여라."})
-    # 인테이크도 매 턴 "방금 한 말을 받아준 뒤에 묻는다"고 지시받으므로
-    # converse와 똑같이 같은 위로를 되풀이한다. 같은 장치를 건다.
-    openings = _recent_bot_openings(state)
-    opening_note = _opening_note(openings)
-    if opening_note:
-        messages.append(opening_note)
     messages += _history(state)
 
     try:
@@ -539,14 +481,12 @@ async def ask_intake(state: CbState) -> Dict[str, Any]:
         logger.exception("[intake] 생성 실패 — 고정 문구로 대체")
         text = ""
 
-    text = _drop_repeated_opening(text, openings)
     if not text:
         text = _INTAKE_FALLBACK[missing]
 
     asked = int(state.get("intake_asked") or 0) + 1
     logger.info("[intake] %s 확인 질문 (%d/%d)", missing, asked, MAX_INTAKE_QUESTIONS)
-    return {"answer": text, "messages": _spoken(text),
-            "intake_asked": asked, "intake_last_asked": missing,
+    return {"answer": text, "intake_asked": asked, "intake_last_asked": missing,
             "phase": "gathering"}
 
 
@@ -631,8 +571,7 @@ async def ask_narrow(state: CbState) -> Dict[str, Any]:
     logger.info("[narrow] %s 확인 질문 (대상=%s)",
                 "받는 지원(우회)" if disability_known else "상태·등급",
                 "돌봄대상" if for_caree else "본인")
-    return {"answer": text, "messages": _spoken(text),
-            "narrow_asked": True, "phase": "gathering"}
+    return {"answer": text, "narrow_asked": True, "phase": "gathering"}
 
 
 def user_turns(state: CbState) -> int:
@@ -684,67 +623,6 @@ _INCOME_STAGE_ASK = {
 # 0.7배 감점을 건다. 안 잡히면 그 배율이 **아예 작동하지 않는다.** 반면 소득은
 # 못 잡아도 '모르면 배제하지 않는다'로 안전하게 넘어간다. 손실이 큰 쪽을 먼저 딴다.
 CARE_CONDITIONS = frozenset({"장기요양등급", "장애등록"})
-
-
-def _condition_ask(state: CbState) -> str:
-    """어디가 어떻게 불편하신지. 검색 이전 단계에서 가장 값이 큰 한 턴이다.
-
-    **이분법으로 묻지 않는다.** "신체적 장애세요, 정신적 장애세요?"는 답할 수
-    있는 사람이 드물고, 답을 받아도 856건을 가르지 못한다 — 제도 원문은 그런
-    상위 분류로 자격을 적지 않는다.
-
-    대신 데이터에 실제로 있는 표현의 축으로 예를 든다. 856건 실측(2026-07-31):
-      거동·보행  '휠체어' 12건 / '보행' 4건 / '지체장애' 4건 / '거동' 4건
-      인지       '인지' 28건 / '치매' 10건
-      정신       '정신' 40건 / '우울' 4건
-      감각       '시각장애' 8건 / '청각장애' 6건 / '보청기' 5건
-      치료 중인 병 '재활' 32건 / '희귀' 28건 / '난치' 25건 / '암' 18건
-    이 축으로 답이 오면 eligibility.DISEASE_BOOST_GROUPS가 그대로 받아
-    해당 제도를 맞춤 상단으로 올린다. 축을 벗어난 답도 손해는 없다 —
-    query_text에 실려 검색어가 된다.
-    """
-    who = "돌보시는 분" if state.get("target_for") == constants.TARGET_CAREE else "본인"
-    return (
-        "어디가 어떻게 불편하신지 — %s의 몸 상태를 구체적으로 확인한다. "
-        "일상에서 무엇이 어려운지를 묻고, 답하기 쉽게 예를 두세 개 곁들여라. "
-        "예로 들 만한 것: 걷거나 움직이는 것이 힘드신지, 기억이나 판단이 예전 같지 "
-        "않으신지, 눈이나 귀가 불편하신지, 계속 치료받고 계신 병이 있으신지. "
-        "**'신체적 장애세요, 정신적 장애세요' 같은 이분법으로 묻지 마라** — "
-        "답할 수 있는 사람이 드물고 그 답으로는 제도를 가를 수 없다. "
-        "고르라고 하지 말고 열린 질문으로 묻고, 진단명을 모르셔도 괜찮다고 덧붙여라."
-        % who
-    )
-
-
-def needs_condition_probe(state: CbState) -> bool:
-    """어디가 어떻게 불편하신지를 한 번 물어볼 차례인가. 다른 어떤 질문보다 앞선다.
-
-    실측(2026-07-31, 26세 사용자 / 81세 할아버지): "돌봄이랑 병원비인 것 같아"까지
-    듣고 곧장 매칭으로 넘어갔다. 실제로는 지체장애·낙상 후유증이었는데 아무도
-    묻지 않아서, 제도의 서비스 내용과 대조할 상태 정보가 슬롯에 없었다.
-    그 결과 eligibility.disease_boost가 통째로 무동작이 됐고(대화에 질환어가
-    하나도 없으면 가산도 감점도 하지 않는다), 노인 돌봄군이 주제 태그만으로
-    뭉텅이로 올라왔다.
-
-    이미 상태가 드러난 대화에서는 묻지 않는다. 판정은 순위에 실제로 쓰이는
-    표('DISEASE_BOOST_GROUPS')로 한다 — 그 표에 걸리는 말이 나왔다면 순위가
-    이미 움직인다는 뜻이고, 걸리지 않았다면 사용자가 무슨 말을 했든 검색에는
-    아직 아무것도 실리지 않았다는 뜻이다.
-
-    소득·등급보다 먼저다. 등급과 소득은 못 잡아도 '모르면 배제하지 않는다'로
-    넘어가지만, 상태를 모르면 무엇을 찾아야 하는지 자체가 정해지지 않는다.
-    """
-    if state.get("condition_asked") or state.get("narrow_asked"):
-        return False
-    # 몸 상태를 물을 근거가 있는 주제인가. 상태·등급 질문과 같은 기준을 쓴다.
-    if not (NARROW_THEMES & set(state.get("theme") or [])):
-        return False
-    if eligibility.mentioned_disease_groups(" ".join(_user_texts(state))):
-        return False
-    budget = MAX_USER_TURNS - (1 if needs_narrow(state) else 0)
-    if user_turns(state) >= budget:
-        return False
-    return not _WANTS_RESULTS.search(_last_user_text(state))
 
 
 def _severity_ask(state: CbState) -> str:
@@ -806,168 +684,6 @@ def _last_bot_text(state: CbState) -> str:
     return ""
 
 
-# 봇이 이미 써먹은 첫마디를 몇 개까지 보여줄지.
-_OPENING_HISTORY = 4
-_SENTENCE_END = re.compile(r"[.!?…]|\n")
-
-
-def _recent_bot_openings(state: CbState, limit: int = _OPENING_HISTORY) -> List[str]:
-    """봇이 최근에 말문을 연 문장들.
-
-    실측(2026-08-01, 배우자 간병 상담): 세 턴이 연달아
-    "간병이 많이 힘드셨겠어요" / "간병이 많이 힘드시겠어요" / "간병이 많이
-    힘드시겠어요"로 시작했다. 매 턴 같은 위로를 되풀이하면 듣는 쪽은 상담자가
-    자기 말을 안 듣고 있다고 느낀다.
-
-    [직전에 네가 한 말]로 전문을 이미 보여주고 있었는데도 막히지 않았다.
-    그 블록은 '질문을 반복하지 마라'로 읽히고 첫마디는 그 지시의 사정권 밖에
-    남는다. 첫 문장만 따로 떼어 목록으로 보여주면 그 표현을 피해 간다.
-
-    프롬프트 규칙만으로는 안 되기 때문에 코드가 실제 문자열을 넣어준다
-    (converse.md의 '한 문장으로만 받아준다'는 이미 있었지만 지켜지지 않았다).
-    """
-    out: List[str] = []
-    for message in reversed(state.get("messages") or []):
-        role = getattr(message, "type", None) or getattr(message, "role", None)
-        if role not in ("ai", "assistant"):
-            continue
-        content = getattr(message, "content", None)
-        if not isinstance(content, str) or not content.strip():
-            continue
-        opening = _SENTENCE_END.split(content.strip(), 1)[0].strip()
-        if opening and opening not in out:
-            out.append(opening)
-        if len(out) >= limit:
-            break
-    return out
-
-
-def _unnamed_disease_note(state: CbState) -> Optional[Dict[str, str]]:
-    """사용자가 증상만 설명하고 병명은 말하지 않았을 때, 봇이 병명을 붙이지 못하게 한다.
-
-    실측(2026-08-01): "기억이 자꾸 흐려지시고 저를 못 알아보실 때가 있어요"에
-    "치매로 인해 기억이 흐려지신다고 하셨군요"라고 답했다. 사용자는 치매라는
-    말을 꺼낸 적이 없다. 진단을 받은 적도 없는데 상담자에게 진단명을 들은 것이
-    되고, 이 서비스는 진단을 하지 않는다.
-
-    검색은 그 추론을 그대로 쓴다(disease_boost). 막는 것은 **입 밖에 내는 것**뿐이다.
-    """
-    said = " ".join(_user_texts(state))
-    unnamed = sorted(
-        name
-        for group, inst_terms in eligibility.mentioned_disease_groups(said).items()
-        for name in inst_terms
-        if name not in said
-    )
-    if not unnamed:
-        return None
-    return {"role": "system", "content":
-            "[주의] 사용자는 병명을 말한 적이 없다. 증상만 설명했다. "
-            "다음 말을 네 답변에 쓰지 마라: %s. "
-            "사용자가 쓴 표현을 그대로 받아라('기억이 흐려지신다고 하셨는데'). "
-            "너는 의료인이 아니고 이 서비스는 진단을 하지 않는다."
-            % ", ".join(unnamed)}
-
-
-def _opening_note(openings: List[str]) -> Optional[Dict[str, str]]:
-    """이미 써먹은 첫마디를 알려주고 되풀이를 막는 system 메시지.
-
-    '받아주지 마라'가 아니다. 받아주되 **이번 턴에 새로 나온 말에만** 반응하라는
-    것이다. 위로 자체를 금지하면 사용자가 무거운 이야기를 꺼낸 턴에도 질문만
-    툭 나가서 더 나쁘다.
-    """
-    if not openings:
-        return None
-    return {"role": "system", "content":
-            "[이미 써먹은 첫마디]\n%s\n"
-            "이 문장들, 그리고 **같은 뜻을 다르게 쓴 말로도** 이번 턴을 시작하지 마라. "
-            "'힘드시겠어요'를 '힘드실 것 같아요'로 바꾸는 것은 피한 것이 아니다.\n"
-            "받아줄 말이 있으면 **사용자가 방금 새로 말한 내용에만** 반응한다. 다만:\n"
-            "- 사용자가 나이·숫자·이름처럼 **사실만 답한 턴은 받아줄 거리가 아니다.** "
-            "인사치레 없이 곧바로 질문으로 시작한다.\n"
-            "- **이미 확보한 사실을 요약해서 되뇌지 마라.** "
-            "'남편분께서 교통사고 후유증으로 지체장애 3급을 받으셨군요' 같은 복창은 "
-            "새 정보가 아니라 앞 대화의 반복이다.\n"
-            "대화 전체의 사정을 매 턴 다시 위로하면 상담자가 대사를 읽는 것처럼 들린다."
-            % "\n".join("- %s" % o for o in openings)}
-
-
-# 첫마디가 앞의 것과 '사실상 같은 말'인지 보는 문턱 (문자 bigram 자카드).
-#
-# 문자 단위가 아니라 **어간 단위**로 비교한다.
-#
-# 처음에는 문자 bigram을 썼는데 한국어에서 약하다. '힘드시겠어요'와 '힘드실
-# 것 같아요'는 같은 말인데 어미가 달라 겹치는 bigram이 셋뿐이라 0.43으로 나왔다.
-# 어간만 보면(힘드/간병/많이) 그대로 일치한다. search.py가 조사·어미를 떼려고
-# 접두 부분문자열을 쓰는 것과 같은 발상이다.
-#
-# 실측(2026-08-01) — 어간 겹침 / 짧은 쪽 대비 비율:
-#   "많이 힘드시겠어요"          / "남편분 간병이 많이 힘드실 것 같아요"  2/2  같은 말
-#   "남편분 간병이 많이 힘드시군요" / "간병이 많이 힘드시겠어요"          3/3  같은 말
-#   "지체장애 판정을 받으셨군요"   / "지체장애 3급 판정을 받으셨군요"      3/3  같은 말
-#   "지체장애 판정을 받으셨군요"   / "간병이 많이 힘드시겠어요"           0/3  다른 말
-#   "혹시 나이가 어떻게 되세요"    / "혹시 지금 받고 계신 지원이 있으신가요" 1/4  다른 말
-_OPENING_CONTAINMENT = 0.6
-# 상투어 하나가 겹친 것("혹시")을 같은 말로 보지 않기 위한 하한.
-_OPENING_MIN_SHARED = 2
-_OPENING_MIN_STEMS = 2
-_OPENING_WORD = re.compile(r"[가-힣]{2,}")
-
-# 이 문장이 무언가를 묻고 있는가.
-#
-# 물음표만으로는 안 된다. 이 봇의 존댓말 질문은 물음표 없이 끝나는 일이 많다
-# ("...알려주시면 좀 더 정확하게 찾아드릴 수 있어요"). 실제로 물음표를 요구했더니
-# 잘라야 할 첫마디가 그대로 남았다(2026-08-01 실측).
-_ASKS = re.compile(r"[?？]|까요|세요|가요|나요|는지|은지|을지|주시겠|어떠|계실|있으실")
-
-
-def _stems(text: str) -> set:
-    """문장에서 어간 후보만 남긴다. 조사·어미는 앞 두 글자만 남기면 대개 떨어진다."""
-    return {word[:2] for word in _OPENING_WORD.findall(text)}
-
-
-def _drop_repeated_opening(text: str, openings: List[str]) -> str:
-    """앞에서 쓴 것과 사실상 같은 첫마디를 잘라낸다.
-
-    프롬프트로는 끝까지 막히지 않았다. [이미 써먹은 첫마디] 목록을 주고 '같은 뜻을
-    다르게 쓴 말로도 시작하지 마라'고 명시한 뒤에도 "남편분 간병이 많이 힘드시군요"
-    다음 턴이 "간병이 많이 힘드시겠어요"로 나왔다. 이 파일의 다른 규칙들과 같은
-    처리를 한다 — 프롬프트로 부탁하고, 코드로 확인한다.
-
-    자르지 않는 경우가 셋 있다. 셋 다 '반복을 한 번 허용하는 것'이 '질문을
-    통째로 날리는 것'보다 낫다는 같은 판단이다.
-      - 답변이 한 문장뿐이다 → 그 문장이 곧 질문이다.
-      - 첫 문장이 무언가를 묻고 있다 → 인사치레가 아니라 이번 턴의 질문이다.
-      - 잘라내고 남는 말에 묻는 것이 없다 → 질문을 잘라낸 것이다.
-    """
-    if not openings or not text:
-        return text
-    parts = _SENTENCE_END.split(text.strip(), 1)
-    if len(parts) < 2:
-        return text
-    head, rest = parts[0].strip(), parts[1].strip()
-    if not head or not rest:
-        return text
-    if _ASKS.search(head) or not _ASKS.search(rest):
-        return text
-
-    mine = _stems(head)
-    if len(mine) < _OPENING_MIN_STEMS:
-        return text
-    for previous in openings:
-        other = _stems(previous)
-        if len(other) < _OPENING_MIN_STEMS:
-            continue
-        shared = len(mine & other)
-        if shared < _OPENING_MIN_SHARED:
-            continue
-        if shared / min(len(mine), len(other)) >= _OPENING_CONTAINMENT:
-            logger.info("[opening] 되풀이된 첫마디를 잘라낸다 (겹친 어간 %s): %r",
-                        sorted(mine & other), head)
-            return rest
-    return text
-
-
 # 사용자가 소득 이야기를 접겠다고 한 신호.
 #
 # '모르겠어요'는 여기 넣지 않는다. 그건 거절이 아니라 1단계의 정상적인 답이고
@@ -995,40 +711,21 @@ def converse_focus(state: CbState) -> Tuple[str, Dict[str, Any]]:
 
     그래서 순서를 코드로 못 박는다. **이미 채워진 슬롯은 건너뛴다.**
       1. 관심주제가 비었다 → 무엇이 가장 부담되는지 (이때만 묻는다)
-      2. 의료·돌봄 주제인데 몸 상태를 모른다 → 어디가 어떻게 불편하신지
-      3. 돌봄 상태가 확인됐는데 장애 정도를 모른다 → 앵커 질문으로 정도 확인
-      4. 소득 구간을 아직 못 잡았다 → 1·2·3단계 중 이번 차례
-      5. 다 됐다 → 짧게 마무리
+      2. 돌봄 상태가 확인됐는데 장애 정도를 모른다 → 앵커 질문으로 정도 확인
+      3. 소득 구간을 아직 못 잡았다 → 1·2·3단계 중 이번 차례
+      4. 다 됐다 → 짧게 마무리
 
-    2가 맨 앞인 이유는 나머지 전부가 그 답에 얹히기 때문이다. 상태를 모르면
-    질환 가산(disease_boost)이 통째로 무동작이고, 등급 질문도 무엇을 물어야
-    할지 정해지지 않는다.
-
-    3이 4보다 앞이다. 중증도가 없으면 grading_adjust의 배율이 아예 작동하지
+    2가 3보다 앞이다. 중증도가 없으면 grading_adjust의 배율이 아예 작동하지
     않는데, 소득은 못 잡아도 '모르면 배제하지 않는다'로 넘어간다.
     """
     if not (state.get("theme") or []):
         return ("지금 가장 부담되는 것이 무엇인지. 분야를 일상어로 예를 들어라 "
                 "('월세나 집 문제', '병원비'처럼)."), {}
 
-    if needs_condition_probe(state):
-        return _condition_ask(state), {"condition_asked": True}
+    if needs_severity_probe(state):
+        return _severity_ask(state), {"severity_asked": True}
 
     probes = int(state.get("income_probes") or 0)
-
-    if needs_severity_probe(state):
-        # 앵커 질문("지금 받고 계신 지원의 **이름**")은 소득 1단계와 사실상 같은
-        # 질문이다. 소진 처리하지 않으면 바로 다음 턴에 "지금 받고 계신 지원이나
-        # 수급이 있으신가요?"가 거의 같은 문장으로 또 나간다.
-        #
-        # 실측(2026-08-01, 배우자 간병 상담):
-        #   봇 > 지금 받고 계신 장애 관련 지원이 있으신가요? 활동지원서비스나 장애인연금 같은…
-        #   나 > 지체장애 3급을 받았어
-        #   봇 > 혹시 지금 받고 계신 지원이나 수급 중인 혜택이 있으신가요? 이름만 알려주시면 돼요.
-        # 2·3단계(대략의 액수, 가구 안팎의 소득)는 다른 질문이라 그대로 남는다.
-        return _severity_ask(state), {"severity_asked": True,
-                                      "income_probes": max(probes, 1)}
-
     wrap_up = ("그 외에 더 걸리는 것이 있는지 짧게 확인하고 마무리한다. "
                "이미 확보한 것은 다시 묻지 않는다.")
 
@@ -1145,16 +842,6 @@ async def converse(state: CbState) -> Dict[str, Any]:
                          "[직전에 네가 한 말] %s\n"
                          "이 문장을 다시 쓰지 마라. 같은 것을 또 묻지 마라." % previous})
 
-    # 위 블록은 '질문을 반복하지 마라'로 읽혀서 첫마디는 그대로 남았다.
-    # 말문 여는 문장만 따로 떼어 한 번 더 막는다.
-    openings = _recent_bot_openings(state)
-    opening_note = _opening_note(openings)
-    if opening_note:
-        messages.append(opening_note)
-    disease_note = _unnamed_disease_note(state)
-    if disease_note:
-        messages.append(disease_note)
-
     logger.info("[converse] 초점=%s%s", focus[:34],
                 " %s" % update if update else "")
     messages += _history(state)
@@ -1173,13 +860,11 @@ async def converse(state: CbState) -> Dict[str, Any]:
         logger.exception("[converse] 생성 실패 — 고정 문구로 대체")
         text = ""
 
-    text = _drop_repeated_opening(text, openings)
     if not text:
         text = ("어떤 부분이 가장 힘드신가요? "
                 "주거비, 병원비, 일자리처럼 지금 가장 마음에 걸리는 걸 알려주시면 찾아볼게요.")
 
-    update.update({"answer": text, "messages": _spoken(text),
-                   "asked_followup": True, "phase": "gathering"})
+    update.update({"answer": text, "asked_followup": True, "phase": "gathering"})
     return update
 
 
@@ -1234,12 +919,6 @@ def _rerank(rows: List[Dict[str, Any]], state: CbState,
     # ask_narrow가 마지막 한 턴을 써서 받아낸 답이다. 추정이 아니라 명시적
     # 답변이라 가장 확실한 신호인데, 지금까지 순위에 쓰이지 않고 있었다.
     rows = eligibility.condition_boost(rows, state.get("conditions") or [])
-    # 본인 몫 주제로만 걸린 등록장애인 전용 제도를 내린다. 돌보는 분을 위해
-    # 찾는 대화에서만 돈다 — 본인이 곧 등록장애인인 대화에서는 그 제도들이
-    # 정확히 사용자 것이다.
-    if state.get("target_for") == constants.TARGET_CAREE:
-        rows = eligibility.axis_adjust(
-            rows, state.get("self_themes") or [], state.get("caree_themes") or [])
     # 자격이 어긋나는 건은 여기서 목록에서 빠진다. 그래서 검색은 최종 노출
     # 건수보다 넉넉히 가져온다 (cards.SEARCH_LIMIT).
     rows = eligibility.apply(

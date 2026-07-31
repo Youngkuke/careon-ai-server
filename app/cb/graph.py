@@ -4,7 +4,7 @@
            └─ 사용자 발화 ↓
         extract_intent ─┬─ 대상/나이 미확인 ──→ ask_intake ──→ END  phase=gathering
                         ├─ 아직 부족 ────────→ converse ────→ END  phase=gathering
-                        ├─ 충분 & 상태/정도/소득 미확인 → converse → END  phase=gathering
+                        ├─ 충분 & 정도/소득 미확인 → converse → END  phase=gathering
                         ├─ 충분 & 등급 미확인 → ask_narrow ──→ END  phase=gathering
                         └─ 충분 ↓
                      search_institutions ─┬─ 0건 & 미완화 ──→ relax_filters ─┐
@@ -79,25 +79,18 @@ def route_after_intent(state: CbState) -> str:
     한 턴 늘리지만, 안 물으면 자격이 안 맞는 제도가 결과의 절반을 차지한다.
 
     검색으로 넘어갈 때가 됐어도 아직 딸 것이 남았으면 대화 턴을 더 끼운다.
-    순서는 몸 상태(needs_condition_probe) → 장애 정도(needs_severity_probe) →
-    소득(needs_income_probe)이다. 상태를 모르면 질환 가산이 통째로 무동작이고,
-    중증도가 없으면 grading_adjust의 배율이 작동하지 않는 반면, 소득은 못 잡아도
-    '모르면 배제하지 않는다'로 넘어가기 때문이다.
-
-    **이 셋은 is_ready가 true여도 검색을 미룬다.** 미루지 않으면 관심주제와
-    나이만으로 곧장 검색으로 가는 대화에서 이 질문들이 한 번도 나가지 못한다
-    (2026-07-31 실측: "돌봄이랑 병원비" 다음 턴이 곧바로 검색이었다).
+    순서는 장애 정도(needs_severity_probe) → 소득(needs_income_probe)이다.
+    중증도가 없으면 grading_adjust의 배율이 아예 작동하지 않는 반면, 소득은
+    못 잡아도 '모르면 배제하지 않는다'로 넘어가기 때문이다.
 
     상태·등급 질문(ask_narrow)은 '마지막 질문'이라고 말하고 나가므로 반드시
-    이 셋보다 뒤에 온다.
+    이 둘보다 뒤에 온다.
     """
     if not nodes.intake_done(state):
         return "ask_intake"
     if not nodes.is_ready(state):
         return "converse"
-    if (nodes.needs_condition_probe(state)
-            or nodes.needs_severity_probe(state)
-            or nodes.needs_income_probe(state)):
+    if nodes.needs_severity_probe(state) or nodes.needs_income_probe(state):
         return "converse"
     return "ask_narrow" if nodes.needs_narrow(state) else "search_institutions"
 
