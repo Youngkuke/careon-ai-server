@@ -38,6 +38,20 @@ class CbState(TypedDict, total=False):
     household: Annotated[List[str], merge_tags]
     theme: Annotated[List[str], merge_tags]
 
+    # 같은 관심주제가 **누구 몫으로** 나온 것인가. theme의 부분집합이고,
+    # 검색 필터로는 쓰지 않는다 (필터는 theme 하나로 계속 돈다) — 순위에서만 쓴다.
+    #
+    # 왜 필요한가 (2026-07-31 실측): 26세 사용자가 81세 할아버지 상담 중에
+    # "저도 일자리가 빠듯하다"고 **본인** 이야기를 했는데 결과에
+    # 「장애인일자리지원」(등록장애인 전용)이 섞였다. theme=[일자리]는 본인 몫이고
+    # 장애 관련 사실은 할아버지 쪽인데, 두 축이 한 주머니에 들어 있어서 이 둘을
+    # 곱한 제도를 걸러낼 근거가 아무 데도 없었다.
+    #
+    # 어느 쪽인지 불분명한 주제는 양쪽 어디에도 넣지 않는다. 잘못 귀속시키면
+    # 멀쩡한 제도가 내려가는데, 안 넣으면 지금까지와 똑같이 동작할 뿐이다.
+    self_themes: Annotated[List[str], merge_tags]
+    caree_themes: Annotated[List[str], merge_tags]
+
     # 상태·등급. 3종 필터와 달리 '해당한다'와 '해당하지 않는다'를 나눠 들고 있다.
     #
     # 해당하지 않는다는 답은 결과를 좁히는 데 곧바로 쓰인다. 반면 답을 안 했거나
@@ -47,6 +61,10 @@ class CbState(TypedDict, total=False):
     denied_conditions: Annotated[List[str], merge_tags]
     # 상태·등급을 한 번 물었는가. 같은 질문을 두 번 하지 않기 위한 표시.
     narrow_asked: bool
+    # 어디가 어떻게 불편하신지를 물어봤는가. 등급·소득보다 **먼저** 딱 한 번 묻는다.
+    # 이게 없으면 "아프시다"는 말 하나로 곧장 매칭으로 넘어가서, 제도의
+    # 서비스 내용과 대조할 상태 정보가 슬롯에 아예 없는 채로 검색이 돈다.
+    condition_asked: bool
     # 소득을 물어본 converse 턴 수. 1단계(앵커) → 2단계(대략의 액수) →
     # 3단계(가구 안팎의 소득)로 넘어갈지 정하고, 동시에 상한이 된다.
     # 이 값이 없으면 소득 질문이 대화를 끝없이 늘린다.
@@ -148,7 +166,9 @@ def initial_state(user_id: int, region_sgg: Optional[str] = None) -> CbState:
         user_id=user_id,
         messages=[],
         life_cycle=[], household=[], theme=[],
+        self_themes=[], caree_themes=[],
         conditions=[], denied_conditions=[], narrow_asked=False,
+        condition_asked=False,
         income_probes=0, severity_asked=False,
         income_category=None, disability_severity_hint=None,
         monthly_income=None, household_size=None,
